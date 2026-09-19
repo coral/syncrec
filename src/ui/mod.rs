@@ -566,11 +566,16 @@ impl App {
             text("syncrec").size(22),
             Space::new().width(Fill),
             column![
-                text(format!("NTP {}", state.label())).size(13),
+                row![
+                    status_dot(state == SyncState::Synced),
+                    text(format!("NTP {}", state.label())).size(13),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
                 text(detail).size(11).color(DIM),
             ]
             .align_x(Alignment::End)
-            .spacing(1),
+            .spacing(2),
         ]
         .align_y(Alignment::Center)
         .into()
@@ -755,6 +760,30 @@ impl App {
 }
 
 const LABEL_W: f32 = 64.0;
+
+/// Diameter of the sync indicator.
+const DOT: f32 = 9.0;
+const SYNC_OK: Color = Color::from_rgb(0.26, 0.78, 0.42);
+
+/// A filled circle showing at a glance whether the clock can timestamp a take.
+///
+/// Green uses the same condition as the record button, so the two can never
+/// disagree; anything short of a usable fix is amber rather than red, because an
+/// unsynced clock is a "wait a moment", not a fault.
+fn status_dot<'a>(ok: bool) -> Element<'a, Message> {
+    let colour = if ok { SYNC_OK } else { WARN };
+    container(Space::new().width(DOT).height(DOT))
+        .style(move |_theme| container::Style {
+            background: Some(colour.into()),
+            border: Border {
+                // A radius of half the box turns the square into a circle.
+                radius: (DOT / 2.0).into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
 
 /// Secondary text. Dimmer than the body so the numbers that matter stand out.
 const DIM: Color = Color::from_rgb(0.62, 0.64, 0.68);
