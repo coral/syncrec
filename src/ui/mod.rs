@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iced::widget::{
-    Space, button, checkbox, column, container, pick_list, row, rule, text, text_input,
+    Space, button, column, container, pick_list, row, rule, text, text_input,
 };
 use iced::{Alignment, Border, Color, Element, Fill, Length, Subscription, Task, Theme};
 
@@ -53,7 +53,6 @@ pub enum Message {
     NtpServerChanged(String),
     NtpServerCommitted,
     TrimChanged(String),
-    ResampleToggled(bool),
     ToggleRecord,
     RequestPermission,
     OpenSettings,
@@ -89,7 +88,6 @@ pub struct App {
     base_name: String,
     ntp_server: String,
     trim_text: String,
-    resample: bool,
 
     clock: Arc<Mutex<ClockModel>>,
     poller: Option<sntp::Poller>,
@@ -124,7 +122,6 @@ impl App {
             base_name: "rec".into(),
             ntp_server,
             trim_text: "0.0".into(),
-            resample: true,
             clock,
             poller,
             permission: permission::status(),
@@ -181,15 +178,16 @@ impl App {
         })
     }
 
-    /// One line explaining what the clock is still waiting for.
+    /// How many NTP exchanges are still needed, or `None` once the clock is ready.
     fn clock_hint(&self) -> Option<String> {
         let snap = self.clock_snapshot()?;
         if snap.state == SyncState::Synced && snap.accepted >= finalize::MIN_CLOCK_SAMPLES {
             return None;
         }
         Some(format!(
-            "waiting for NTP — {}/{} exchanges accepted; a take started now cannot be drift-corrected",
-            snap.accepted, finalize::MIN_CLOCK_SAMPLES
+            "waiting for NTP {}/{}",
+            snap.accepted.min(finalize::MIN_CLOCK_SAMPLES),
+            finalize::MIN_CLOCK_SAMPLES
         ))
     }
 
@@ -282,10 +280,6 @@ impl App {
                 if s.is_empty() || s.parse::<f64>().is_ok() || s == "-" {
                     self.trim_text = s;
                 }
-                Task::none()
-            }
-            Message::ResampleToggled(v) => {
-                self.resample = v;
                 Task::none()
             }
             Message::ToggleRecord => {
@@ -505,7 +499,6 @@ impl App {
         };
 
         let snapshot = self.clock_snapshot();
-        let resample = self.resample;
         let trim_ms = self.trim_ms();
         let (tx, rx) = channel();
 
@@ -514,7 +507,7 @@ impl App {
         std::thread::Builder::new()
             .name("syncrec-finalize".into())
             .spawn(move || {
-                let result = finalize_take(&take.sidecar, &take.paths, snapshot, resample, trim_ms)
+                let result = finalize_take(&take.sidecar, &take.paths, snapshot, trim_ms)
                     .map(Box::new)
                     .map_err(|e| format!("{e:#}"));
                 let _ = tx.send(result);
@@ -699,14 +692,6 @@ impl App {
             labelled("Folder", dir.into()),
             labelled("Name", name.into()),
             labelled("Clock", clock_row.into()),
-            labelled(
-                "Correct",
-                checkbox(self.resample)
-                    .label("resample to exactly 48 kHz on save")
-                    .text_size(13)
-                    .on_toggle(Message::ResampleToggled)
-                    .into(),
-            ),
         ]
         .spacing(8)
         .into()
@@ -741,34 +726,30 @@ impl App {
             .style(record_style(ready || recording, enabled))
             .on_press_maybe(enabled.then_some(Message::ToggleRecord));
 
-        // One status line, replaced in place. No dismiss button to chase.
-        let status: Element<'_, Message> = if let Some(e) = &self.error {
-            text(e.as_str()).size(11).color(ERROR).into()
-        } else if let Some(hint) = self.clock_hint().filter(|_| !recording && !finalizing) {
-            text(hint).size(11).color(WARN).into()
-        } else if let Some(msg) = &self.last_result {
-            text(msg.as_str()).size(11).color(DIM).into()
-        } else if recording {
-            let p = match &self.stage {
-                Stage::Recording { recording, .. } => recording.progress.observations(),
-                _ => 0,
-            };
-            text(format!("{p} drift marks")).size(11).color(DIM).into()
-        } else {
-            text("").size(11).into()
+        // One short line, and it lives on its own row. Sharing a row with the
+        // transport meant a long message shoved the record button off the window.
+        let status: Element<'_, Message> = match (&self.error, self.clock_hint()) {
+            (Some(e), _) => text(e.as_str()).size(11).color(ERROR).into(),
+            (None, Some(hint)) if !recording && !finalizing => {
+                text(hint).size(11).color(WARN).into()
+            }
+            _ => match &self.last_result {
+                Some(msg) => text(msg.as_str()).size(11).color(DIM).into(),
+                None => Space::new().height(Length::Fixed(13.0)).into(),
+            },
         };
 
         column![
+            status,
             row![
-                status,
                 Space::new().width(Fill),
                 text(elapsed).size(30),
                 Space::new().width(Length::Fixed(16.0)),
                 record,
             ]
-            .spacing(8)
             .align_y(Alignment::Center),
         ]
+        .spacing(6)
         .into()
     }
 }
@@ -858,7 +839,6 @@ fn finalize_take(
     sidecar: &Sidecar,
     paths: &TakePaths,
     snapshot: Option<ClockSnapshot>,
-    resample: bool,
     trim_ms: f64,
 ) -> anyhow::Result<Outcome> {
     // Without an anchor we still have to write something, but it must be visibly
@@ -892,32 +872,39 @@ fn finalize_take(
 
     let clock = snapshot.unwrap_or_else(|| ClockModel::new(Instant::now()).snapshot());
 
-    // Turning correction off means shipping the take as captured; the gate is what
-    // decides whether an *attempted* correction is trustworthy, so bypass it by
-    // offering no observations rather than by lying to it.
-    let observations: &[_] = if resample { &sidecar.observations } else { &[] };
+    // Correction is not optional. Whether it is actually applied is the safety
+    // gate's decision, made from the measurements, not a switch in the window.
+    let outcome = finalize::finalize(
+        &paths.raw,
+        &paths.final_wav,
+        &sidecar.observations,
+        &clock,
+        &provenance,
+    )?;
 
-    finalize::finalize(&paths.raw, &paths.final_wav, observations, &clock, &provenance)
+    // The Broadcast Wave file already carries t0, the measured rate, the drift
+    // ratio, the NTP server and the dispersion in its CodingHistory and iXML. The
+    // sidecar adds only the raw per-observation rows the fit was derived from, so
+    // on a clean take it is redundant and a successful take should leave exactly
+    // one file. When the gate fails it is the evidence for why, and it stays put
+    // alongside the scratch capture.
+    if outcome.corrected() {
+        let _ = std::fs::remove_file(&paths.sidecar);
+    }
+
+    Ok(outcome)
 }
 
+/// The post-take status line.
+///
+/// Deliberately terse. Why a take was not corrected is recorded in the file's
+/// `CodingHistory` and in the sidecar; spelling every unmet gate condition out in
+/// the window just buried the transport controls.
 fn describe_outcome(file: &str, o: &Outcome) -> String {
-    match (o.resampled, o.fit.as_ref()) {
-        (true, Some(f)) => format!(
-            "{file} · corrected {:+.2} ppm (device ran at {:.3} Hz)",
-            f.crystal_ppm(o.provenance.device_rate),
-            f.measured_rate
-        ),
-        (false, _) => {
-            let why = o
-                .gate
-                .reason()
-                .unwrap_or_else(|| "correction not requested".into());
-            format!(
-                "{file} · uncorrected at {} Hz — {why}",
-                o.provenance.sample_rate
-            )
-        }
-        _ => file.to_string(),
+    match (o.resampled, o.gate.short_reason()) {
+        (true, _) => format!("saved {file}"),
+        (false, Some(why)) => format!("saved {file} · {why}"),
+        (false, None) => format!("saved {file} · uncorrected"),
     }
 }
 

@@ -343,6 +343,48 @@ impl GateReport {
         )
     }
 
+    /// The single most actionable reason, in a few words, for the status bar.
+    ///
+    /// `reason` lists every unmet condition, which is right for a log and far too
+    /// much for a window. The failures are not independent — a short take trips the
+    /// span check, the observation-count check and often the fit as well — so
+    /// showing all of them buries the one thing the operator can act on.
+    pub fn short_reason(&self) -> Option<&'static str> {
+        if self.failures.is_empty() {
+            return None;
+        }
+        // Ordered by what the operator would do about it, not by severity.
+        let has = |pred: fn(&GateFailure) -> bool| self.failures.iter().any(pred);
+
+        if has(|f| {
+            matches!(
+                f,
+                GateFailure::SpanTooShort { .. }
+                    | GateFailure::TooFewObservations { .. }
+                    | GateFailure::NoUsableFit { .. }
+            )
+        }) {
+            // Over a take this short the drift is a fraction of a millisecond
+            // anyway, so this is a statement about the measurement, not a fault.
+            return Some("too short to measure drift");
+        }
+        if has(|f| {
+            matches!(
+                f,
+                GateFailure::ClockNotSynced { .. } | GateFailure::TooFewClockSamples { .. }
+            )
+        }) {
+            return Some("clock was not synced");
+        }
+        if has(|f| matches!(f, GateFailure::ImplausibleDrift { .. })) {
+            return Some("measured drift implausible");
+        }
+        if has(|f| matches!(f, GateFailure::NoisyFit { .. })) {
+            return Some("clock too noisy to fit");
+        }
+        Some("could not verify the correction")
+    }
+
     fn push(&mut self, failure: GateFailure) {
         self.failures.push(failure);
     }
@@ -767,6 +809,38 @@ pub fn finalize(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_short_take_reports_its_length_not_a_list_of_conditions() {
+        // The case a user actually hits: NTP is fine, the take is 8 seconds.
+        let clock = synced_clock();
+        let obs = observations(8, 48_000.0);
+        let fit = fit_drift(&obs);
+        let gate = evaluate_gate(&clock, &obs, fit.as_ref(), 48_000);
+        assert!(!gate.passed());
+        assert_eq!(gate.short_reason(), Some("too short to measure drift"));
+        // The full list is still available for the file and the log.
+        assert!(gate.reason().unwrap().contains("span"));
+    }
+
+    #[test]
+    fn a_passing_gate_has_no_short_reason() {
+        let clock = synced_clock();
+        let obs = observations(60, 47_999.4);
+        let fit = fit_drift(&obs);
+        let gate = evaluate_gate(&clock, &obs, fit.as_ref(), 48_000);
+        assert!(gate.passed(), "{:?}", gate.reason());
+        assert_eq!(gate.short_reason(), None);
+    }
+
+    #[test]
+    fn an_unsynced_clock_outranks_other_complaints_once_the_take_is_long_enough() {
+        let clock = clock_with(0);
+        let obs = observations(60, 47_999.4);
+        let fit = fit_drift(&obs);
+        let gate = evaluate_gate(&clock, &obs, fit.as_ref(), 48_000);
+        assert_eq!(gate.short_reason(), Some("clock was not synced"));
+    }
     use super::*;
     use crate::clock::ClockModel;
     use std::sync::atomic::{AtomicU32, Ordering};

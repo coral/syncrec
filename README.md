@@ -89,16 +89,28 @@ reports the device's measured rate.
 
 ## What a take produces
 
+A take that corrects cleanly leaves **one file**:
+
 ```
-rec-1.wav                          the Broadcast Wave file that ships
-rec-1.json                         audit trail: every drift observation, the fit,
-                                   the NTP sample log
-.syncrec-scratch/rec-1.raw.wav     32-bit float live capture, deleted once a
-                                   corrected file exists
+rec-1.wav        the Broadcast Wave file
 ```
 
-The scratch capture is float so the audio is quantised to 24 bits exactly once,
-after resampling, rather than twice.
+`t0` to the nanosecond, the measured sample rate, the drift ratio, the NTP server,
+the sync state and the dispersion all travel inside it, in `bext` `CodingHistory`
+and in iXML. Nothing else is needed to interpret the take.
+
+A take that could *not* be corrected keeps its evidence instead:
+
+```
+rec-1.wav                          written uncorrected, labelled with the device's
+                                   real rate rather than 48000
+rec-1.json                         every drift observation, the fit, the NTP log
+.syncrec-scratch/rec-1.raw.wav     the untouched 32-bit float capture
+```
+
+So a clean folder means every take is corrected, and anything left behind is
+something to look at. The scratch capture is float so the audio is quantised to 24
+bits exactly once, after resampling, rather than twice.
 
 ## The safety gate
 
@@ -120,6 +132,17 @@ This is why the record button reads **Syncing…** in muted red until the clock 
 ready, and **Record** in bright red once a take started now could be corrected.
 Recording is never actually blocked — missing the moment is worse than an
 uncorrected take.
+
+**The timestamp is not gated.** `t0`, `TimeReference`, `OriginationDate`/`Time` and
+the measured rate are written on every take regardless of the outcome; the gate
+decides only whether the audio is *resampled*. A take that fails the gate is still
+correctly timestamped, and still records what rate the device was measured at — it
+simply declines to apply a number it could not measure well enough to trust.
+
+Short takes routinely fail the gate, and that is the right answer rather than a
+fault: over 8 seconds the slope standard error is around 44 ppm, far noisier than
+the ~30 ppm being corrected, while the total drift is only about 0.24 ms. There is
+nothing worth correcting and no way to measure it if there were.
 
 ## Layout
 

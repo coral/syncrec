@@ -81,7 +81,7 @@ pub fn build(device: &Device, negotiated: &Negotiated) -> Result<Capture> {
     let (mark_tx, mark_rx) = RingBuffer::<TimeMark>::new(MARK_QUEUE_LEN);
     let (err_tx, err_rx) = channel();
 
-    let meters = Arc::new(Meters::new(channels));
+    let meters = Arc::new(Meters::new(channels, negotiated.rate));
     let mark_every = (negotiated.rate as f64 * MARK_INTERVAL_SECONDS) as u64;
 
     // Size the conversion scratch from what the device says it may hand us, so the
@@ -232,7 +232,7 @@ mod tests {
                 mark_every,
                 producer: p,
                 marks: mp,
-                meters: Arc::new(Meters::new(channels)),
+                meters: Arc::new(Meters::new(channels, 48_000)),
                 frames_seen: 0,
                 next_mark_at: 0,
                 scratch: Vec::with_capacity(4096),
@@ -308,7 +308,7 @@ mod tests {
     fn a_full_ring_counts_an_overrun_and_keeps_going() {
         let (p, _c) = RingBuffer::<f32>::new(4);
         let (mp, _mc) = RingBuffer::<TimeMark>::new(64);
-        let meters = Arc::new(Meters::new(1));
+        let meters = Arc::new(Meters::new(1, 48_000));
         let mut ctx = CallbackCtx {
             channels: 1,
             mark_every: 1_000_000,
