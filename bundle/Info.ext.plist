@@ -1,0 +1,12 @@
+<!-- NOTE: cargo-bundle splices this file verbatim into the middle of the <dict> it
+     generates. It is therefore a BARE FRAGMENT of key/value pairs: adding an XML
+     declaration, a DOCTYPE, or <plist>/<dict> wrappers here nests a second document
+     inside the first and produces an Info.plist macOS cannot parse, which makes the
+     app fail to launch. Do not "fix" this into a complete plist.
+     Keys cargo-bundle already emits (CFBundle*, LSMinimumSystemVersion,
+     LSApplicationCategoryType, NSHighResolutionCapable) must not be repeated. -->
+
+<!-- Shown in the macOS microphone permission prompt. Without this key the process
+     is denied access to the microphone, often silently, and cannot record at all. -->
+<key>NSMicrophoneUsageDescription</key>
+<string>syncrec needs the microphone to record audio from your selected input device.</string>

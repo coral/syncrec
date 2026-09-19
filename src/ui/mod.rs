@@ -1,0 +1,942 @@
+//! The iced front end.
+//!
+//! The interesting decision here is that the input stream runs continuously from
+//! the moment a device is chosen, not from the moment the operator hits record.
+//! You cannot set gain against a meter that only comes alive once you are already
+//! recording, and handing the already-running stream to the writer means pressing
+//! record does not reopen the device — so there is no glitch, and no risk of the
+//! device being grabbed by something else in between.
+
+pub mod meter;
+
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use iced::widget::{
+    Space, button, checkbox, column, container, pick_list, row, rule, text, text_input,
+};
+use iced::{Alignment, Border, Color, Element, Fill, Length, Subscription, Task, Theme};
+
+use crate::audio::capture::Capture;
+use crate::audio::meters::Meters;
+use crate::audio::session::{self, Recording};
+use crate::audio::writer::{Sidecar, TakePaths};
+use crate::audio::{self, DeviceChoice, Negotiated};
+use crate::bwf::Provenance;
+use crate::clock::{ClockModel, ClockSnapshot, SyncState, sntp};
+use crate::finalize::{self, Outcome};
+use crate::latency::{InputLatency, LatencyCorrection};
+use crate::permission::{self, PermissionStatus};
+
+/// Meter refresh. Fast enough that a transient peak is never missed by the eye.
+const TICK: Duration = Duration::from_millis(16);
+
+pub fn run() -> iced::Result {
+    iced::application(App::boot, App::update, App::view)
+        .title(App::title)
+        .subscription(App::subscription)
+        .theme(App::theme)
+        .window_size((760.0, 620.0))
+        .run()
+}
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    Tick,
+    RefreshDevices,
+    DeviceSelected(DeviceChoice),
+    BrowseDir,
+    DirPicked(Option<PathBuf>),
+    BaseNameChanged(String),
+    NtpServerChanged(String),
+    NtpServerCommitted,
+    TrimChanged(String),
+    ResampleToggled(bool),
+    ToggleRecord,
+    RequestPermission,
+    OpenSettings,
+    ClearClip,
+}
+
+/// What the recorder is doing right now.
+enum Stage {
+    Idle,
+    Recording {
+        recording: Recording,
+        /// The take's own meters. The monitor stream is gone while recording, so
+        /// the UI reads levels from the capture the writer owns.
+        meters: Arc<Meters>,
+    },
+    /// Resampling on a worker thread; the UI stays responsive.
+    Finalizing { rx: Receiver<Result<Box<Outcome>, String>> },
+}
+
+/// A live input stream that is not (yet) being written anywhere.
+struct Monitor {
+    capture: Option<Capture>,
+    meters: Arc<Meters>,
+    negotiated: Negotiated,
+}
+
+pub struct App {
+    devices: Vec<DeviceChoice>,
+    selected: Option<DeviceChoice>,
+    monitor: Option<Monitor>,
+
+    output_dir: PathBuf,
+    base_name: String,
+    ntp_server: String,
+    trim_text: String,
+    resample: bool,
+
+    clock: Arc<Mutex<ClockModel>>,
+    poller: Option<sntp::Poller>,
+
+    permission: PermissionStatus,
+    permission_rx: Option<Receiver<PermissionStatus>>,
+
+    stage: Stage,
+    take: Option<TakePaths>,
+    last_result: Option<String>,
+    error: Option<String>,
+    next_preview: String,
+
+    // Reused every frame so the meter does not allocate at 60 Hz.
+    peaks: Vec<f32>,
+    rms: Vec<f32>,
+    clips: Vec<bool>,
+}
+
+impl App {
+    fn boot() -> (Self, Task<Message>) {
+        let default_dir = dirs_audio_fallback();
+        let clock = Arc::new(Mutex::new(ClockModel::new(Instant::now())));
+        let ntp_server = "pool.ntp.org".to_string();
+        let poller = Some(sntp::Poller::spawn(ntp_server.clone(), Arc::clone(&clock)));
+
+        let mut app = Self {
+            devices: Vec::new(),
+            selected: None,
+            monitor: None,
+            output_dir: default_dir,
+            base_name: "rec".into(),
+            ntp_server,
+            trim_text: "0.0".into(),
+            resample: true,
+            clock,
+            poller,
+            permission: permission::status(),
+            permission_rx: None,
+            stage: Stage::Idle,
+            take: None,
+            last_result: None,
+            error: None,
+            next_preview: String::new(),
+            peaks: Vec::new(),
+            rms: Vec::new(),
+            clips: Vec::new(),
+        };
+        app.refresh_preview();
+
+        // Ask for the microphone before touching any device, so the first thing the
+        // operator sees is the system prompt rather than an inscrutable failure.
+        let task = if app.permission.can_prompt() {
+            Task::done(Message::RequestPermission)
+        } else {
+            Task::done(Message::RefreshDevices)
+        };
+        (app, task)
+    }
+
+    fn title(&self) -> String {
+        match &self.stage {
+            Stage::Recording { .. } => "syncrec — recording".into(),
+            Stage::Finalizing { .. } => "syncrec — finalising".into(),
+            Stage::Idle => "syncrec".into(),
+        }
+    }
+
+    fn theme(&self) -> Theme {
+        Theme::Dark
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        iced::time::every(TICK).map(|_| Message::Tick)
+    }
+
+    fn clock_snapshot(&self) -> Option<ClockSnapshot> {
+        self.clock.lock().ok().map(|m| m.snapshot())
+    }
+
+    /// Whether the clock is good enough for a take to be correctable.
+    ///
+    /// These are the same conditions `finalize`'s safety gate applies, checked up
+    /// front so the operator learns the take will not be corrected *before*
+    /// recording it rather than afterwards.
+    fn clock_ready(&self) -> bool {
+        self.clock_snapshot().is_some_and(|s| {
+            s.state == SyncState::Synced && s.accepted >= finalize::MIN_CLOCK_SAMPLES
+        })
+    }
+
+    /// One line explaining what the clock is still waiting for.
+    fn clock_hint(&self) -> Option<String> {
+        let snap = self.clock_snapshot()?;
+        if snap.state == SyncState::Synced && snap.accepted >= finalize::MIN_CLOCK_SAMPLES {
+            return None;
+        }
+        Some(format!(
+            "waiting for NTP — {}/{} exchanges accepted; a take started now cannot be drift-corrected",
+            snap.accepted, finalize::MIN_CLOCK_SAMPLES
+        ))
+    }
+
+    fn trim_ms(&self) -> f64 {
+        self.trim_text.trim().parse().unwrap_or(0.0)
+    }
+
+    fn latency(&self) -> LatencyCorrection {
+        let platform = InputLatency::query(self.selected.as_ref().map(|d| d.name.as_str()));
+        LatencyCorrection::new(platform, self.trim_ms())
+    }
+
+    fn refresh_preview(&mut self) {
+        let base = if self.base_name.trim().is_empty() {
+            "rec"
+        } else {
+            self.base_name.trim()
+        };
+        let paths = crate::audio::writer::next_take(&self.output_dir, base);
+        self.next_preview = paths
+            .final_wav
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Tick => self.on_tick(),
+            Message::RefreshDevices => {
+                match audio::input_devices() {
+                    Ok(devices) => {
+                        // Keep the current choice if it is still plugged in.
+                        let keep = self
+                            .selected
+                            .as_ref()
+                            .filter(|s| devices.iter().any(|d| d.id == s.id))
+                            .cloned();
+                        self.devices = devices;
+                        let pick = keep.or_else(|| self.devices.first().cloned());
+                        if pick != self.selected {
+                            self.selected = pick;
+                            self.open_monitor();
+                        }
+                    }
+                    Err(e) => self.error = Some(format!("{e:#}")),
+                }
+                Task::none()
+            }
+            Message::DeviceSelected(d) => {
+                self.selected = Some(d);
+                self.open_monitor();
+                Task::none()
+            }
+            Message::BrowseDir => {
+                let start = self.output_dir.clone();
+                Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_directory(start)
+                            .set_title("Choose where to record")
+                            .pick_folder()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    Message::DirPicked,
+                )
+            }
+            Message::DirPicked(Some(dir)) => {
+                self.output_dir = dir;
+                self.refresh_preview();
+                Task::none()
+            }
+            Message::DirPicked(None) => Task::none(),
+            Message::BaseNameChanged(s) => {
+                // Keep the sequence name usable as a filename.
+                self.base_name = s.replace(['/', '\\', ':'], "-");
+                self.refresh_preview();
+                Task::none()
+            }
+            Message::NtpServerChanged(s) => {
+                self.ntp_server = s;
+                Task::none()
+            }
+            Message::NtpServerCommitted => {
+                self.restart_clock();
+                Task::none()
+            }
+            Message::TrimChanged(s) => {
+                if s.is_empty() || s.parse::<f64>().is_ok() || s == "-" {
+                    self.trim_text = s;
+                }
+                Task::none()
+            }
+            Message::ResampleToggled(v) => {
+                self.resample = v;
+                Task::none()
+            }
+            Message::ToggleRecord => {
+                match self.stage {
+                    Stage::Idle => self.start_recording(),
+                    Stage::Recording { .. } => self.stop_recording(),
+                    Stage::Finalizing { .. } => {}
+                }
+                Task::none()
+            }
+            Message::RequestPermission => {
+                let (tx, rx) = channel();
+                match permission::request(tx) {
+                    Ok(()) => self.permission_rx = Some(rx),
+                    Err(e) => self.error = Some(format!("{e:#}")),
+                }
+                Task::none()
+            }
+            Message::OpenSettings => {
+                if let Err(e) = permission::open_settings() {
+                    self.error = Some(format!("{e:#}"));
+                }
+                Task::none()
+            }
+            Message::ClearClip => {
+                if let Some(m) = &self.monitor {
+                    m.meters.clear_clip();
+                }
+                Task::none()
+            }
+        }
+    }
+
+    fn on_tick(&mut self) -> Task<Message> {
+        if let Some(rx) = &self.permission_rx
+            && let Ok(status) = rx.try_recv()
+        {
+            self.permission = status;
+            self.permission_rx = None;
+            if status.can_attempt_capture() {
+                return Task::done(Message::RefreshDevices);
+            }
+        }
+
+        // Levels come from whichever stream is live: the monitor when idle, the
+        // take's own capture while recording.
+        let meters = match &self.stage {
+            Stage::Recording { meters, .. } => Some(Arc::clone(meters)),
+            _ => self.monitor.as_ref().map(|m| Arc::clone(&m.meters)),
+        };
+        if let Some(meters) = meters {
+            meters.take_peaks(&mut self.peaks);
+            meters.rms(&mut self.rms);
+            self.clips.clear();
+            for ch in 0..meters.channels() {
+                self.clips.push(meters.clipped(ch));
+            }
+        }
+
+        // Nothing drains the monitor's ring, so empty it here or the overrun
+        // counter climbs against a take that has not started.
+        if let Some(monitor) = &mut self.monitor
+            && let Some(capture) = &mut monitor.capture
+        {
+            while capture.audio.pop().is_ok() {}
+            while capture.marks.pop().is_ok() {}
+        }
+
+        if let Stage::Finalizing { rx } = &self.stage
+            && let Ok(result) = rx.try_recv()
+        {
+            match result {
+                Ok(outcome) => {
+                    let name = self
+                        .take
+                        .as_ref()
+                        .map(|t| file_name(&t.final_wav))
+                        .unwrap_or_default();
+                    self.last_result = Some(describe_outcome(&name, &outcome));
+                }
+                Err(e) => self.error = Some(e),
+            }
+            self.stage = Stage::Idle;
+            self.refresh_preview();
+            self.open_monitor();
+        }
+
+        Task::none()
+    }
+
+    /// Open (or reopen) the always-on input stream for the selected device.
+    fn open_monitor(&mut self) {
+        self.monitor = None;
+        let Some(choice) = self.selected.clone() else {
+            return;
+        };
+
+        let result = audio::find_device(&choice)
+            .and_then(|device| {
+                let negotiated = audio::negotiate(&device)?;
+                let capture = audio::capture::build(&device, &negotiated)?;
+                capture.play()?;
+                Ok((capture, negotiated))
+            })
+            .map_err(|e| {
+                // On Windows a blocked microphone only shows up here, at open time.
+                if let Some(cpal_err) = e.downcast_ref::<cpal::Error>()
+                    && permission::is_permission_denied(cpal_err)
+                {
+                    self.permission = PermissionStatus::Denied;
+                }
+                format!("{e:#}")
+            });
+
+        match result {
+            Ok((capture, negotiated)) => {
+                self.monitor = Some(Monitor {
+                    meters: Arc::clone(&capture.meters),
+                    capture: Some(capture),
+                    negotiated,
+                });
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn restart_clock(&mut self) {
+        // Drop the old poller first so only one thread is ever polling.
+        self.poller = None;
+        self.clock = Arc::new(Mutex::new(ClockModel::new(Instant::now())));
+        let server = self.ntp_server.trim().to_string();
+        if !server.is_empty() {
+            self.poller = Some(sntp::Poller::spawn(server, Arc::clone(&self.clock)));
+        }
+    }
+
+    fn start_recording(&mut self) {
+        let Some(choice) = self.selected.clone() else {
+            self.error = Some("no input device selected".into());
+            return;
+        };
+
+        let base = if self.base_name.trim().is_empty() {
+            "rec"
+        } else {
+            self.base_name.trim()
+        };
+        if let Err(e) = std::fs::create_dir_all(&self.output_dir) {
+            self.error = Some(format!("cannot create {}: {e}", self.output_dir.display()));
+            return;
+        }
+        let paths = crate::audio::writer::next_take(&self.output_dir, base);
+
+        // Open a brand new stream for the take rather than handing over the
+        // monitoring one.
+        //
+        // The whole time base rests on "file sample 0 is the stream's first
+        // captured frame", which is what makes the first callback's timestamp a
+        // valid anchor. A monitoring stream has already been counting frames and
+        // has already thrown frame 0 away, so reusing it offsets every sample index
+        // by however long the operator spent setting gain and leaves the take with
+        // no anchor at all. Reopening costs tens of milliseconds, once, and buys
+        // back the invariant.
+        self.monitor = None;
+
+        let built = audio::find_device(&choice).and_then(|device| {
+            let negotiated = audio::negotiate(&device)?;
+            let capture = audio::capture::build(&device, &negotiated)?;
+            Ok(capture)
+        });
+        let capture = match built {
+            Ok(c) => c,
+            Err(e) => {
+                self.error = Some(format!("{e:#}"));
+                self.open_monitor();
+                return;
+            }
+        };
+
+        let meters = Arc::clone(&capture.meters);
+        let config = session::SessionConfig {
+            paths: paths.clone(),
+            device_name: choice.name.clone(),
+            ntp_server: self.ntp_server.clone(),
+            latency: self.latency(),
+        };
+
+        match session::start(capture, Arc::clone(&self.clock), config) {
+            Ok(recording) => {
+                self.take = Some(paths);
+                self.last_result = None;
+                self.error = None;
+                self.stage = Stage::Recording { recording, meters };
+            }
+            Err(e) => {
+                self.error = Some(format!("{e:#}"));
+                self.open_monitor();
+            }
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        let Stage::Recording { recording, .. } =
+            std::mem::replace(&mut self.stage, Stage::Idle)
+        else {
+            return;
+        };
+
+        let take = match recording.stop() {
+            Ok(t) => t,
+            Err(e) => {
+                self.error = Some(format!("{e:#}"));
+                self.open_monitor();
+                return;
+            }
+        };
+
+        let snapshot = self.clock_snapshot();
+        let resample = self.resample;
+        let trim_ms = self.trim_ms();
+        let (tx, rx) = channel();
+
+        // Resampling a long take is slow; do it off the UI thread and report back
+        // through the same tick that drives the meters.
+        std::thread::Builder::new()
+            .name("syncrec-finalize".into())
+            .spawn(move || {
+                let result = finalize_take(&take.sidecar, &take.paths, snapshot, resample, trim_ms)
+                    .map(Box::new)
+                    .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(result);
+            })
+            .ok();
+
+        self.stage = Stage::Finalizing { rx };
+        self.open_monitor();
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        let mut body = column![self.header(), rule::horizontal(1)].spacing(12);
+
+        if self.permission.needs_settings_visit() {
+            body = body.push(self.permission_panel());
+        }
+
+        body = body
+            .push(self.device_row())
+            .push(self.meter_panel())
+            .push(rule::horizontal(1))
+            .push(self.destination_rows())
+            .push(Space::new().height(Fill))
+            .push(rule::horizontal(1))
+            .push(self.transport());
+
+        container(body.spacing(12))
+            .padding(18)
+            .width(Fill)
+            .height(Fill)
+            .into()
+    }
+
+    fn header(&self) -> Element<'_, Message> {
+        let (state, detail) = match self.clock_snapshot() {
+            Some(s) => {
+                let disp = s
+                    .dispersion()
+                    .map(|d| format!("±{:.1} ms", d * 1e3))
+                    .unwrap_or_else(|| "±?".into());
+                let ppm = s
+                    .fit()
+                    .filter(|f| f.slope_trusted)
+                    .map(|f| format!(" · {:+.1} ppm", f.ppm()))
+                    .unwrap_or_default();
+                let off = s
+                    .system_clock_error()
+                    .map(|e| format!(" · OS clock {:+.1} ms", e * 1e3))
+                    .unwrap_or_default();
+                (s.state, format!("{disp}{ppm}{off} · {} polls", s.accepted))
+            }
+            None => (SyncState::Unsynced, "clock unavailable".into()),
+        };
+
+        row![
+            text("syncrec").size(22),
+            Space::new().width(Fill),
+            column![
+                text(format!("NTP {}", state.label())).size(13),
+                text(detail).size(11).color(DIM),
+            ]
+            .align_x(Alignment::End)
+            .spacing(1),
+        ]
+        .align_y(Alignment::Center)
+        .into()
+    }
+
+    fn permission_panel(&self) -> Element<'_, Message> {
+        container(
+            column![
+                text("Microphone access is blocked").size(14),
+                text(self.permission.advice()).size(12).color(DIM),
+                button(text("Open privacy settings").size(12)).on_press(Message::OpenSettings),
+            ]
+            .spacing(6),
+        )
+        .padding(10)
+        .width(Fill)
+        .into()
+    }
+
+    fn device_row(&self) -> Element<'_, Message> {
+        let format = match &self.monitor {
+            Some(m) => {
+                let rate = if m.negotiated.native_target_rate {
+                    format!("{} Hz", m.negotiated.rate)
+                } else {
+                    format!("{} Hz → 48000 on save", m.negotiated.rate)
+                };
+                format!("{} ch · {rate}", m.negotiated.channels)
+            }
+            None => "no input".into(),
+        };
+
+        column![
+            row![
+                text("Input").size(13).width(Length::Fixed(LABEL_W)),
+                pick_list(
+                    self.devices.clone(),
+                    self.selected.clone(),
+                    Message::DeviceSelected
+                )
+                .placeholder("no input devices")
+                .width(Fill),
+                button(text("Rescan").size(12)).on_press(Message::RefreshDevices),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            row![
+                Space::new().width(Length::Fixed(LABEL_W + 8.0)),
+                text(format).size(11).color(DIM),
+            ],
+        ]
+        .spacing(4)
+        .into()
+    }
+
+    fn meter_panel(&self) -> Element<'_, Message> {
+        let channels = self.monitor.as_ref().map(|m| m.meters.channels()).unwrap_or(1);
+        let data = meter::MeterData::new(&self.peaks, &self.rms, &self.clips);
+        let any_clip = self.clips.iter().any(|c| *c);
+
+        let mut stack = column![
+            meter::meter(data)
+                .width(Fill)
+                .height(Length::Fixed(meter::preferred_height(channels)))
+        ]
+        .spacing(4);
+
+        // The clip latch only appears once there is something to clear, rather than
+        // occupying a permanently dead button.
+        if any_clip {
+            stack = stack.push(
+                row![
+                    Space::new().width(Fill),
+                    button(text("Clear clip").size(11)).on_press(Message::ClearClip),
+                ]
+            );
+        }
+        stack.into()
+    }
+
+    fn destination_rows(&self) -> Element<'_, Message> {
+        let dir = row![
+            text(self.output_dir.display().to_string()).size(12),
+            Space::new().width(Fill),
+            button(text("Browse…").size(12)).on_press(Message::BrowseDir),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let name = row![
+            text_input("rec", &self.base_name)
+                .on_input(Message::BaseNameChanged)
+                .size(13)
+                .width(Length::Fixed(160.0)),
+            text(format!("next: {}", self.next_preview)).size(12).color(DIM),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        let clock_row = row![
+            text_input("pool.ntp.org", &self.ntp_server)
+                .on_input(Message::NtpServerChanged)
+                .on_submit(Message::NtpServerCommitted)
+                .size(13)
+                .width(Length::Fixed(160.0)),
+            button(text("Apply").size(12)).on_press(Message::NtpServerCommitted),
+            Space::new().width(Length::Fixed(20.0)),
+            text("Trim").size(12).color(DIM),
+            text_input("0.0", &self.trim_text)
+                .on_input(Message::TrimChanged)
+                .size(13)
+                .width(Length::Fixed(64.0)),
+            text("ms").size(12).color(DIM),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        column![
+            labelled("Folder", dir.into()),
+            labelled("Name", name.into()),
+            labelled("Clock", clock_row.into()),
+            labelled(
+                "Correct",
+                checkbox(self.resample)
+                    .label("resample to exactly 48 kHz on save")
+                    .text_size(13)
+                    .on_toggle(Message::ResampleToggled)
+                    .into(),
+            ),
+        ]
+        .spacing(8)
+        .into()
+    }
+
+    fn transport(&self) -> Element<'_, Message> {
+        let recording = matches!(self.stage, Stage::Recording { .. });
+        let finalizing = matches!(self.stage, Stage::Finalizing { .. });
+        let ready = self.clock_ready();
+
+        let elapsed = match &self.stage {
+            Stage::Recording { recording, .. } => hms(recording.progress.elapsed(recording.rate)),
+            _ => "00:00:00".into(),
+        };
+
+        // Recording is never blocked on the clock: missing the moment is worse than
+        // an uncorrected take. The button says what you will get instead.
+        let (label, enabled) = if finalizing {
+            ("Finalising…", false)
+        } else if recording {
+            ("Stop", true)
+        } else if self.monitor.is_none() {
+            ("No input", false)
+        } else if ready {
+            ("Record", true)
+        } else {
+            ("Syncing…", true)
+        };
+
+        let record = button(text(label).size(15))
+            .padding([11, 26])
+            .style(record_style(ready || recording, enabled))
+            .on_press_maybe(enabled.then_some(Message::ToggleRecord));
+
+        // One status line, replaced in place. No dismiss button to chase.
+        let status: Element<'_, Message> = if let Some(e) = &self.error {
+            text(e.as_str()).size(11).color(ERROR).into()
+        } else if let Some(hint) = self.clock_hint().filter(|_| !recording && !finalizing) {
+            text(hint).size(11).color(WARN).into()
+        } else if let Some(msg) = &self.last_result {
+            text(msg.as_str()).size(11).color(DIM).into()
+        } else if recording {
+            let p = match &self.stage {
+                Stage::Recording { recording, .. } => recording.progress.observations(),
+                _ => 0,
+            };
+            text(format!("{p} drift marks")).size(11).color(DIM).into()
+        } else {
+            text("").size(11).into()
+        };
+
+        column![
+            row![
+                status,
+                Space::new().width(Fill),
+                text(elapsed).size(30),
+                Space::new().width(Length::Fixed(16.0)),
+                record,
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .into()
+    }
+}
+
+const LABEL_W: f32 = 64.0;
+
+/// Secondary text. Dimmer than the body so the numbers that matter stand out.
+const DIM: Color = Color::from_rgb(0.62, 0.64, 0.68);
+const WARN: Color = Color::from_rgb(0.90, 0.72, 0.30);
+const ERROR: Color = Color::from_rgb(0.93, 0.44, 0.40);
+
+/// Bright red once the clock can actually timestamp a take, muted before that.
+///
+/// Hardcoded rather than taken from the theme palette: a record button has to read
+/// as *red* in any theme, and the operator needs to tell "armed" from "not yet"
+/// across the room without reading the label.
+fn record_style(ready: bool, enabled: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let base = if !enabled {
+            Color::from_rgb(0.28, 0.28, 0.30)
+        } else if ready {
+            Color::from_rgb(0.86, 0.16, 0.16)
+        } else {
+            // Desaturated red: recognisably the record button, visibly not armed.
+            Color::from_rgb(0.44, 0.31, 0.32)
+        };
+        let background = match status {
+            button::Status::Hovered | button::Status::Pressed => lighten(base, 0.12),
+            _ => base,
+        };
+        button::Style {
+            background: Some(background.into()),
+            text_color: if enabled {
+                Color::WHITE
+            } else {
+                Color::from_rgb(0.6, 0.6, 0.62)
+            },
+            border: Border {
+                radius: 6.0.into(),
+                ..Border::default()
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
+fn lighten(c: Color, amount: f32) -> Color {
+    Color {
+        r: (c.r + amount).min(1.0),
+        g: (c.g + amount).min(1.0),
+        b: (c.b + amount).min(1.0),
+        a: c.a,
+    }
+}
+
+fn labelled<'a>(label: &'a str, content: Element<'a, Message>) -> Element<'a, Message> {
+    row![
+        text(label).size(13).width(Length::Fixed(LABEL_W)),
+        content,
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn file_name(p: &std::path::Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn hms(d: Duration) -> String {
+    let s = d.as_secs();
+    format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+}
+
+/// Where takes land by default.
+fn dirs_audio_fallback() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|h| h.join("Music").join("syncrec"))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Turn a finished take into the file that ships.
+fn finalize_take(
+    sidecar: &Sidecar,
+    paths: &TakePaths,
+    snapshot: Option<ClockSnapshot>,
+    resample: bool,
+    trim_ms: f64,
+) -> anyhow::Result<Outcome> {
+    // Without an anchor we still have to write something, but it must be visibly
+    // untrusted rather than quietly wrong.
+    let (t0, sync_state) = match sidecar.t0_unix_nanos {
+        Some(t0) => (t0, sidecar.sync_state.clone()),
+        None => (
+            crate::clock::unix_nanos(std::time::SystemTime::now())
+                - (sidecar.raw_frames as i128 * 1_000_000_000
+                    / sidecar.device_rate.max(1) as i128),
+            "unsynced".to_string(),
+        ),
+    };
+
+    let provenance = Provenance {
+        t0_unix_nanos: t0,
+        sample_rate: audio::TARGET_RATE,
+        channels: sidecar.channels,
+        bits_per_sample: 24,
+        device_name: sidecar.device_name.clone(),
+        device_rate: sidecar.device_rate,
+        measured_rate: None,
+        drift_ratio: None,
+        resampled: false,
+        ntp_server: sidecar.ntp_server.clone(),
+        ntp_dispersion_s: sidecar.ntp_dispersion_s,
+        sync_state,
+        slope_ppm: sidecar.clock_slope_ppm,
+        latency_offset_ms: trim_ms,
+    };
+
+    let clock = snapshot.unwrap_or_else(|| ClockModel::new(Instant::now()).snapshot());
+
+    // Turning correction off means shipping the take as captured; the gate is what
+    // decides whether an *attempted* correction is trustworthy, so bypass it by
+    // offering no observations rather than by lying to it.
+    let observations: &[_] = if resample { &sidecar.observations } else { &[] };
+
+    finalize::finalize(&paths.raw, &paths.final_wav, observations, &clock, &provenance)
+}
+
+fn describe_outcome(file: &str, o: &Outcome) -> String {
+    match (o.resampled, o.fit.as_ref()) {
+        (true, Some(f)) => format!(
+            "{file} · corrected {:+.2} ppm (device ran at {:.3} Hz)",
+            f.crystal_ppm(o.provenance.device_rate),
+            f.measured_rate
+        ),
+        (false, _) => {
+            let why = o
+                .gate
+                .reason()
+                .unwrap_or_else(|| "correction not requested".into());
+            format!(
+                "{file} · uncorrected at {} Hz — {why}",
+                o.provenance.sample_rate
+            )
+        }
+        _ => file.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hms_formats_a_long_take() {
+        assert_eq!(hms(Duration::from_secs(0)), "00:00:00");
+        assert_eq!(hms(Duration::from_secs(59)), "00:00:59");
+        assert_eq!(hms(Duration::from_secs(61)), "00:01:01");
+        assert_eq!(hms(Duration::from_secs(3661)), "01:01:01");
+        assert_eq!(hms(Duration::from_secs(36_000)), "10:00:00");
+    }
+
+    #[test]
+    fn file_name_survives_a_bare_path() {
+        assert_eq!(file_name(std::path::Path::new("/tmp/rec-3.wav")), "rec-3.wav");
+        assert_eq!(file_name(std::path::Path::new("")), "");
+    }
+}

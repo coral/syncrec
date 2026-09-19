@@ -1,0 +1,24 @@
+# Build output. Also covers the cargo-bundle artefacts, which land in
+# target/<profile>/bundle/ (the .app and the .dmg).
+/target
+
+# Cargo.lock is deliberately NOT ignored. syncrec is an application, not a
+# library, so the lockfile is committed to pin the exact dependency versions the
+# timing behaviour was verified against.
+
+# Recorded takes, if the output folder is ever pointed at the working tree.
+# Takes default to ~/Music/syncrec, so this normally catches nothing — but the
+# scratch directory holds large 32-bit float captures and is never worth keeping.
+.syncrec-scratch/
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# Coverage instrumentation
+*.profraw

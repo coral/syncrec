@@ -1,0 +1,54 @@
+[package]
+name = "syncrec"
+version = "0.1.0"
+edition = "2024"
+description = "NTP-timestamped BWF audio recorder"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+cpal = "0.18"
+rtrb = "0.4"
+rubato = "5.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bwavfile = "2.0"
+rfd = "0.17"
+rsntp = { version = "4.1", default-features = false }
+iced = { version = "0.14", features = ["canvas", "smol"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-av-foundation = "0.3"
+objc2-foundation = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+# Declared explicitly rather than relying on cargo feature unification to hand us
+# cpal's. Inheriting them works today but means a cpal dependency change could break
+# our Windows build with no cause visible anywhere in this repo.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Devices_Properties",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+
+[profile.release]
+opt-level = 3
+
+[package.metadata.bundle]
+name = "syncrec"
+identifier = "dev.syncrec.app"
+short_description = "NTP-timestamped BWF audio recorder"
+long_description = """
+syncrec records Broadcast Wave files whose timestamps come from its own in-process
+SNTP client rather than the operating system clock, and corrects each take for the
+audio device's measured sample-rate drift.
+"""
+category = "public.app-category.music"
+osx_minimum_system_version = "11.0"
+osx_info_plist_exts = ["bundle/Info.ext.plist"]
