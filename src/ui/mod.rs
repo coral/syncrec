@@ -6,29 +6,45 @@
 //! recording, and handing the already-running stream to the writer means pressing
 //! record does not reopen the device — so there is no glitch, and no risk of the
 //! device being grabbed by something else in between.
+//!
+//! The window has two screens. The recording screen carries only what changes take
+//! to take: the device, the meters, the folder, the transport. Everything that
+//! belongs to the rig rather than the take — which clock to trust, the NTP server,
+//! the frame rate, which machine leads — lives on the settings screen, where an
+//! operator watching a meter cannot reach it by accident.
+//!
+//! In ethersync follower mode the record button is not a button. The leader's
+//! transport is the record state for the whole rig, so this machine watches it and
+//! rolls when it rolls; offering a local override would only ever produce a take
+//! that does not line up with the others.
 
 pub mod meter;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iced::widget::{
-    Space, button, column, container, pick_list, row, rule, text, text_input,
+    Space, button, checkbox, column, container, pick_list, radio, row, rule, scrollable, text,
+    text_input,
 };
 use iced::{Alignment, Border, Color, Element, Fill, Length, Subscription, Task, Theme};
+use libethersync::DiscoveredLeader;
 
 use crate::audio::capture::Capture;
 use crate::audio::meters::Meters;
 use crate::audio::session::{self, Recording};
 use crate::audio::writer::{Sidecar, TakePaths};
 use crate::audio::{self, DeviceChoice, Negotiated};
-use crate::bwf::Provenance;
-use crate::clock::{ClockModel, ClockSnapshot, SyncState, sntp};
+use crate::bwf::{Provenance, TimecodeStamp};
+use crate::clock::{ClockModel, ClockSnapshot, NtpReference, RefStatus, Reference, sntp};
+use crate::ethersync::{Fps, Link, Role};
 use crate::finalize::{self, Outcome};
 use crate::latency::{InputLatency, LatencyCorrection};
 use crate::permission::{self, PermissionStatus};
+use crate::settings::{Settings, TimeSource};
 
 /// Meter refresh. Fast enough that a transient peak is never missed by the eye.
 const TICK: Duration = Duration::from_millis(16);
@@ -38,7 +54,7 @@ pub fn run() -> iced::Result {
         .title(App::title)
         .subscription(App::subscription)
         .theme(App::theme)
-        .window_size((760.0, 620.0))
+        .window_size((760.0, 660.0))
         .run()
 }
 
@@ -50,13 +66,32 @@ pub enum Message {
     BrowseDir,
     DirPicked(Option<PathBuf>),
     BaseNameChanged(String),
+    ToggleRecord,
+    RequestPermission,
+    OpenPrivacySettings,
+    ClearClip,
+
+    ShowSettings,
+    ShowRecorder,
+    SourceSelected(TimeSource),
     NtpServerChanged(String),
     NtpServerCommitted,
     TrimChanged(String),
-    ToggleRecord,
-    RequestPermission,
-    OpenSettings,
-    ClearClip,
+    RoleSelected(Role),
+    FpsSelected(Fps),
+    DropFrameToggled(bool),
+    LeaderNameChanged(String),
+    LeaderPortChanged(String),
+    FollowerAddressChanged(String),
+    LinkSettingsCommitted,
+    UseDiscovered(String),
+}
+
+/// Which screen is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Record,
+    Settings,
 }
 
 /// What the recorder is doing right now.
@@ -86,11 +121,34 @@ pub struct App {
 
     output_dir: PathBuf,
     base_name: String,
-    ntp_server: String,
+
+    settings: Settings,
+    /// Text mirrors for the numeric settings, so a half-typed value is not thrown
+    /// away by a parse failure between keystrokes.
     trim_text: String,
+    port_text: String,
+    screen: Screen,
 
     clock: Arc<Mutex<ClockModel>>,
     poller: Option<sntp::Poller>,
+
+    link: Option<Link>,
+    /// Leaders seen on the LAN while browsing.
+    discovered: Vec<DiscoveredLeader>,
+    /// Addresses a follower could be pointed at, when we are the leader.
+    /// Cached: enumerating interfaces is not something to do sixty times a second.
+    endpoints: Vec<SocketAddr>,
+    endpoints_checked: Instant,
+    /// A discovered address that would not connect, so we stop hammering it.
+    refused: Option<SocketAddr>,
+    /// The leader's transport state as of the last tick, for edge detection.
+    rolling: Option<bool>,
+    /// The leader rolled again while we were still finalising the last take.
+    pending_roll: bool,
+
+    /// Refreshed once a tick so `view` never has to touch a reader.
+    status: RefStatus,
+    timecode: Option<String>,
 
     permission: PermissionStatus,
     permission_rx: Option<Receiver<PermissionStatus>>,
@@ -111,8 +169,7 @@ impl App {
     fn boot() -> (Self, Task<Message>) {
         let default_dir = dirs_audio_fallback();
         let clock = Arc::new(Mutex::new(ClockModel::new(Instant::now())));
-        let ntp_server = "pool.ntp.org".to_string();
-        let poller = Some(sntp::Poller::spawn(ntp_server.clone(), Arc::clone(&clock)));
+        let settings = Settings::load();
 
         let mut app = Self {
             devices: Vec::new(),
@@ -120,10 +177,21 @@ impl App {
             monitor: None,
             output_dir: default_dir,
             base_name: "rec".into(),
-            ntp_server,
-            trim_text: "0.0".into(),
+            trim_text: format_trim(settings.trim_ms),
+            port_text: settings.leader_port.to_string(),
+            screen: Screen::Record,
+            settings,
             clock,
-            poller,
+            poller: None,
+            link: None,
+            discovered: Vec::new(),
+            endpoints: Vec::new(),
+            endpoints_checked: Instant::now(),
+            refused: None,
+            rolling: None,
+            pending_roll: false,
+            status: offline_status("starting"),
+            timecode: None,
             permission: permission::status(),
             permission_rx: None,
             stage: Stage::Idle,
@@ -136,6 +204,7 @@ impl App {
             clips: Vec::new(),
         };
         app.refresh_preview();
+        app.apply_time_source();
 
         // Ask for the microphone before touching any device, so the first thing the
         // operator sees is the system prompt rather than an inscrutable failure.
@@ -163,41 +232,272 @@ impl App {
         iced::time::every(TICK).map(|_| Message::Tick)
     }
 
+    // -----------------------------------------------------------------------
+    // The time reference
+    // -----------------------------------------------------------------------
+
     fn clock_snapshot(&self) -> Option<ClockSnapshot> {
         self.clock.lock().ok().map(|m| m.snapshot())
     }
 
     /// Whether the clock is good enough for a take to be correctable.
     ///
-    /// These are the same conditions `finalize`'s safety gate applies, checked up
-    /// front so the operator learns the take will not be corrected *before*
-    /// recording it rather than afterwards.
+    /// The same condition `finalize`'s safety gate applies, checked up front so the
+    /// operator learns the take will not be corrected *before* recording it rather
+    /// than afterwards.
     fn clock_ready(&self) -> bool {
-        self.clock_snapshot().is_some_and(|s| {
-            s.state == SyncState::Synced && s.accepted >= finalize::MIN_CLOCK_SAMPLES
-        })
+        self.status.ready()
     }
 
-    /// How many NTP exchanges are still needed, or `None` once the clock is ready.
-    fn clock_hint(&self) -> Option<String> {
-        let snap = self.clock_snapshot()?;
-        if snap.state == SyncState::Synced && snap.accepted >= finalize::MIN_CLOCK_SAMPLES {
-            return None;
-        }
-        Some(format!(
-            "waiting for NTP {}/{}",
-            snap.accepted.min(finalize::MIN_CLOCK_SAMPLES),
-            finalize::MIN_CLOCK_SAMPLES
-        ))
+    /// Whether this machine is driving the rig's transport.
+    fn leading(&self) -> bool {
+        self.settings.source == TimeSource::Ethersync
+            && self.settings.role == Role::Leader
+            && self.link.is_some()
     }
+
+    /// Whether this machine's record button belongs to somebody else.
+    fn slaved(&self) -> bool {
+        self.settings.source == TimeSource::Ethersync && self.settings.role == Role::Follower
+    }
+
+    /// Build the reference this take will be measured against.
+    fn reference(&self) -> anyhow::Result<Box<dyn Reference>> {
+        match self.settings.source {
+            TimeSource::Ntp => Ok(Box::new(NtpReference::new(
+                self.settings.ntp_server.clone(),
+                Arc::clone(&self.clock),
+            ))),
+            TimeSource::Ethersync => {
+                let link = self
+                    .link
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("no ethersync link"))?;
+                Ok(Box::new(link.reference()?))
+            }
+        }
+    }
+
+    /// Tear down whichever reference is running and start the configured one.
+    fn apply_time_source(&mut self) {
+        self.poller = None;
+        self.link = None;
+        self.discovered.clear();
+        self.endpoints.clear();
+        self.refused = None;
+        self.rolling = None;
+        self.pending_roll = false;
+        match self.settings.source {
+            TimeSource::Ntp => self.restart_clock(),
+            TimeSource::Ethersync => self.relink(),
+        }
+        self.refresh_status();
+    }
+
+    fn restart_clock(&mut self) {
+        // Drop the old poller first so only one thread is ever polling.
+        self.poller = None;
+        self.clock = Arc::new(Mutex::new(ClockModel::new(Instant::now())));
+        let server = self.settings.ntp_server.trim().to_string();
+        if !server.is_empty() {
+            self.poller = Some(sntp::Poller::spawn(server, Arc::clone(&self.clock)));
+        }
+    }
+
+    /// Stand up the ethersync engine for the configured role.
+    fn relink(&mut self) {
+        // The old engine owns a worker thread, a UDP socket and possibly an mDNS
+        // registration. Drop it before binding anything again.
+        self.link = None;
+        self.discovered.clear();
+        self.endpoints.clear();
+        self.refused = None;
+        self.rolling = None;
+
+        let format = match self.settings.fps.format(self.settings.drop_frame) {
+            Ok(f) => f,
+            Err(e) => {
+                self.error = Some(format!("{e:#}"));
+                return;
+            }
+        };
+        let built = match self.settings.role {
+            Role::Leader => Link::leader(
+                &self.settings.leader_name,
+                self.settings.leader_port,
+                format,
+                true,
+            ),
+            Role::Follower => match self.settings.follower_socket() {
+                Some(address) => Link::follower(address, None, format),
+                // No address typed: browse, and take the first leader that
+                // answers. On a rig with one leader that is the right answer and
+                // saves the operator typing an IP into a laptop in a field.
+                None => Link::browsing(format),
+            },
+        };
+        match built {
+            Ok(link) => {
+                self.endpoints = link.endpoints();
+                self.link = Some(link);
+                self.error = None;
+            }
+            Err(e) => self.error = Some(format!("{e:#}")),
+        }
+    }
+
+    /// Re-enumerate the leader's addresses, but only while anyone is looking.
+    ///
+    /// They change when a cable goes in, so a one-shot read at startup would go
+    /// stale — and `local_endpoints` walks the OS interface table, which is not
+    /// something to do on a 60 Hz redraw.
+    fn refresh_endpoints(&mut self) {
+        const EVERY: Duration = Duration::from_secs(1);
+        if self.screen != Screen::Settings
+            || self.settings.role != Role::Leader
+            || self.endpoints_checked.elapsed() < EVERY
+        {
+            return;
+        }
+        self.endpoints_checked = Instant::now();
+        if let Some(link) = &self.link {
+            self.endpoints = link.endpoints();
+        }
+    }
+
+    /// Re-read the reference. Once a tick, so `view` can stay immutable.
+    fn refresh_status(&mut self) {
+        match self.settings.source {
+            TimeSource::Ntp => {
+                self.status = match self.clock_snapshot() {
+                    Some(snap) => NtpReference::status_of(&self.settings.ntp_server, &snap),
+                    None => offline_status("clock unavailable"),
+                };
+                self.timecode = None;
+            }
+            TimeSource::Ethersync => match &mut self.link {
+                Some(link) => {
+                    self.status = link.status();
+                    self.timecode = link.label();
+                }
+                None => {
+                    self.status = offline_status("no link");
+                    self.timecode = None;
+                }
+            },
+        }
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Following the leader
+    // -----------------------------------------------------------------------
+
+    /// Service the link: drain its events, browse, and slave the transport.
+    ///
+    /// The link is taken out of `self` for the duration because reading a timecode
+    /// reader needs `&mut`, and half of what we do with the answer needs `&mut
+    /// self` as well.
+    fn tick_link(&mut self) {
+        let Some(mut link) = self.link.take() else {
+            return;
+        };
+        link.poll_events();
+        let browsing = link.address().is_none();
+        if browsing {
+            self.discovered = link.discovered();
+        }
+        let rolling = (!browsing && self.slaved())
+            .then(|| link.rolling())
+            .flatten();
+        self.link = Some(link);
+
+        if browsing {
+            self.adopt_discovered_leader();
+            return;
+        }
+        if let Some(rolling) = rolling {
+            self.follow_transport(rolling);
+        }
+    }
+
+    /// Connect to the first leader the LAN offers, if we are waiting for one.
+    fn adopt_discovered_leader(&mut self) {
+        if self.settings.follower_socket().is_some() {
+            return;
+        }
+        let Some(leader) = self.discovered.first().cloned() else {
+            return;
+        };
+        // Prefer IPv4: a link-local IPv6 address needs a scope id the operator
+        // cannot see and cannot fix.
+        let Some(address) = leader
+            .addresses
+            .iter()
+            .find(|a| a.is_ipv4())
+            .or_else(|| leader.addresses.first())
+            .copied()
+        else {
+            return;
+        };
+        if self.refused == Some(address) {
+            return;
+        }
+        let Ok(format) = self.settings.fps.format(self.settings.drop_frame) else {
+            return;
+        };
+
+        self.link = None;
+        // The fingerprint came from the same mDNS record as the address, so pinning
+        // it is worth doing even though it is only as trustworthy as the LAN.
+        match Link::follower(address, Some(&leader.fingerprint), format) {
+            Ok(link) => {
+                self.link = Some(link);
+                self.rolling = None;
+                self.error = None;
+            }
+            Err(e) => {
+                self.error = Some(format!("{e:#}"));
+                self.refused = Some(address);
+                // Go back to browsing rather than sitting with no link at all.
+                self.link = Link::browsing(format).ok();
+            }
+        }
+    }
+
+    /// Mirror the leader's transport onto this machine's recorder.
+    fn follow_transport(&mut self, rolling: bool) {
+        if self.rolling == Some(rolling) {
+            return;
+        }
+        self.rolling = Some(rolling);
+        match (&self.stage, rolling) {
+            (Stage::Idle, true) => self.start_recording(),
+            (Stage::Recording { .. }, false) => self.stop_recording(),
+            // The leader stopped and rolled again before the resampler finished.
+            // Remember it; the take starts the moment the thread comes back.
+            (Stage::Finalizing { .. }, true) => self.pending_roll = true,
+            _ => {}
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Housekeeping
+    // -----------------------------------------------------------------------
 
     fn trim_ms(&self) -> f64 {
-        self.trim_text.trim().parse().unwrap_or(0.0)
+        self.settings.trim_ms
     }
 
     fn latency(&self) -> LatencyCorrection {
         let platform = InputLatency::query(self.selected.as_ref().map(|d| d.name.as_str()));
         LatencyCorrection::new(platform, self.trim_ms())
+    }
+
+    fn save_settings(&mut self) {
+        if let Err(e) = self.settings.save() {
+            self.error = Some(format!("could not save settings: {e}"));
+        }
     }
 
     fn refresh_preview(&mut self) {
@@ -268,26 +568,8 @@ impl App {
                 self.refresh_preview();
                 Task::none()
             }
-            Message::NtpServerChanged(s) => {
-                self.ntp_server = s;
-                Task::none()
-            }
-            Message::NtpServerCommitted => {
-                self.restart_clock();
-                Task::none()
-            }
-            Message::TrimChanged(s) => {
-                if s.is_empty() || s.parse::<f64>().is_ok() || s == "-" {
-                    self.trim_text = s;
-                }
-                Task::none()
-            }
             Message::ToggleRecord => {
-                match self.stage {
-                    Stage::Idle => self.start_recording(),
-                    Stage::Recording { .. } => self.stop_recording(),
-                    Stage::Finalizing { .. } => {}
-                }
+                self.toggle_record();
                 Task::none()
             }
             Message::RequestPermission => {
@@ -298,7 +580,7 @@ impl App {
                 }
                 Task::none()
             }
-            Message::OpenSettings => {
+            Message::OpenPrivacySettings => {
                 if let Err(e) = permission::open_settings() {
                     self.error = Some(format!("{e:#}"));
                 }
@@ -308,6 +590,97 @@ impl App {
                 if let Some(m) = &self.monitor {
                     m.meters.clear_clip();
                 }
+                Task::none()
+            }
+
+            Message::ShowSettings => {
+                self.screen = Screen::Settings;
+                Task::none()
+            }
+            Message::ShowRecorder => {
+                self.screen = Screen::Record;
+                self.save_settings();
+                Task::none()
+            }
+            Message::SourceSelected(source) => {
+                if self.settings.source != source {
+                    self.settings.source = source;
+                    self.apply_time_source();
+                    self.save_settings();
+                }
+                Task::none()
+            }
+            Message::NtpServerChanged(s) => {
+                self.settings.ntp_server = s;
+                Task::none()
+            }
+            Message::NtpServerCommitted => {
+                self.restart_clock();
+                self.save_settings();
+                Task::none()
+            }
+            Message::TrimChanged(s) => {
+                if s.is_empty() || s == "-" {
+                    self.trim_text = s;
+                    self.settings.trim_ms = 0.0;
+                } else if let Ok(v) = s.parse::<f64>() {
+                    self.trim_text = s;
+                    self.settings.trim_ms = v;
+                }
+                Task::none()
+            }
+            Message::RoleSelected(role) => {
+                if self.settings.role != role {
+                    self.settings.role = role;
+                    self.relink();
+                    self.save_settings();
+                }
+                Task::none()
+            }
+            Message::FpsSelected(fps) => {
+                if self.settings.fps != fps {
+                    self.settings.fps = fps;
+                    if !fps.supports_drop_frame() {
+                        self.settings.drop_frame = false;
+                    }
+                    self.relink();
+                    self.save_settings();
+                }
+                Task::none()
+            }
+            Message::DropFrameToggled(on) => {
+                self.settings.drop_frame = on;
+                self.relink();
+                self.save_settings();
+                Task::none()
+            }
+            Message::LeaderNameChanged(s) => {
+                self.settings.leader_name = s;
+                Task::none()
+            }
+            Message::LeaderPortChanged(s) => {
+                if s.is_empty() {
+                    self.port_text = s;
+                } else if let Ok(p) = s.parse::<u16>() {
+                    self.port_text = s;
+                    self.settings.leader_port = p;
+                }
+                Task::none()
+            }
+            Message::FollowerAddressChanged(s) => {
+                self.settings.follower_address = s;
+                Task::none()
+            }
+            Message::LinkSettingsCommitted => {
+                self.relink();
+                self.save_settings();
+                Task::none()
+            }
+            Message::UseDiscovered(address) => {
+                self.settings.follower_address = address;
+                self.settings.role = Role::Follower;
+                self.relink();
+                self.save_settings();
                 Task::none()
             }
         }
@@ -323,6 +696,12 @@ impl App {
                 return Task::done(Message::RefreshDevices);
             }
         }
+
+        if self.settings.source == TimeSource::Ethersync {
+            self.tick_link();
+            self.refresh_endpoints();
+        }
+        self.refresh_status();
 
         // Levels come from whichever stream is live: the monitor when idle, the
         // take's own capture while recording.
@@ -365,6 +744,11 @@ impl App {
             self.stage = Stage::Idle;
             self.refresh_preview();
             self.open_monitor();
+
+            // The leader rolled again while this take was still resampling.
+            if std::mem::take(&mut self.pending_roll) && self.rolling == Some(true) {
+                self.start_recording();
+            }
         }
 
         Task::none()
@@ -407,13 +791,44 @@ impl App {
         }
     }
 
-    fn restart_clock(&mut self) {
-        // Drop the old poller first so only one thread is ever polling.
-        self.poller = None;
-        self.clock = Arc::new(Mutex::new(ClockModel::new(Instant::now())));
-        let server = self.ntp_server.trim().to_string();
-        if !server.is_empty() {
-            self.poller = Some(sntp::Poller::spawn(server, Arc::clone(&self.clock)));
+    /// The record button, which in leader mode is the whole rig's record button.
+    fn toggle_record(&mut self) {
+        match self.stage {
+            Stage::Idle => {
+                // Roll the transport *before* opening the stream. The timeline has
+                // to already be running when the first sample lands, or sample zero
+                // resolves against a paused clock and the whole file is stamped
+                // wherever the leader happened to be parked.
+                if self.leading()
+                    && let Some(link) = &mut self.link
+                    && let Err(e) = link.roll()
+                {
+                    self.error = Some(format!("{e:#}"));
+                    return;
+                }
+                self.start_recording();
+                // The capture failed to open. Put the rig back where it was rather
+                // than leaving every follower recording a take this machine is not.
+                if self.leading()
+                    && !matches!(self.stage, Stage::Recording { .. })
+                    && let Some(link) = &mut self.link
+                {
+                    let _ = link.halt();
+                }
+            }
+            Stage::Recording { .. } => {
+                // Stop and drain first. The writer resolves its last marks during
+                // the drain, and it has to do that against a timeline that is still
+                // running or the tail of the take lands on top of itself.
+                self.stop_recording();
+                if self.leading()
+                    && let Some(link) = &mut self.link
+                    && let Err(e) = link.halt()
+                {
+                    self.error = Some(format!("{e:#}"));
+                }
+            }
+            Stage::Finalizing { .. } => {}
         }
     }
 
@@ -433,6 +848,14 @@ impl App {
             return;
         }
         let paths = crate::audio::writer::next_take(&self.output_dir, base);
+
+        let reference = match self.reference() {
+            Ok(r) => r,
+            Err(e) => {
+                self.error = Some(format!("{e:#}"));
+                return;
+            }
+        };
 
         // Open a brand new stream for the take rather than handing over the
         // monitoring one.
@@ -464,11 +887,10 @@ impl App {
         let config = session::SessionConfig {
             paths: paths.clone(),
             device_name: choice.name.clone(),
-            ntp_server: self.ntp_server.clone(),
             latency: self.latency(),
         };
 
-        match session::start(capture, Arc::clone(&self.clock), config) {
+        match session::start(capture, reference, config) {
             Ok(recording) => {
                 self.take = Some(paths);
                 self.last_result = None;
@@ -483,8 +905,7 @@ impl App {
     }
 
     fn stop_recording(&mut self) {
-        let Stage::Recording { recording, .. } =
-            std::mem::replace(&mut self.stage, Stage::Idle)
+        let Stage::Recording { recording, .. } = std::mem::replace(&mut self.stage, Stage::Idle)
         else {
             return;
         };
@@ -498,7 +919,6 @@ impl App {
             }
         };
 
-        let snapshot = self.clock_snapshot();
         let trim_ms = self.trim_ms();
         let (tx, rx) = channel();
 
@@ -507,7 +927,7 @@ impl App {
         std::thread::Builder::new()
             .name("syncrec-finalize".into())
             .spawn(move || {
-                let result = finalize_take(&take.sidecar, &take.paths, snapshot, trim_ms)
+                let result = finalize_take(&take, trim_ms)
                     .map(Box::new)
                     .map_err(|e| format!("{e:#}"));
                 let _ = tx.send(result);
@@ -518,7 +938,18 @@ impl App {
         self.open_monitor();
     }
 
+    // -----------------------------------------------------------------------
+    // Views
+    // -----------------------------------------------------------------------
+
     fn view(&self) -> Element<'_, Message> {
+        match self.screen {
+            Screen::Record => self.record_view(),
+            Screen::Settings => self.settings_view(),
+        }
+    }
+
+    fn record_view(&self) -> Element<'_, Message> {
         let mut body = column![self.header(), rule::horizontal(1)].spacing(12);
 
         if self.permission.needs_settings_visit() {
@@ -542,7 +973,24 @@ impl App {
     }
 
     fn header(&self) -> Element<'_, Message> {
-        let (state, detail) = match self.clock_snapshot() {
+        let right: Element<'_, Message> = match self.settings.source {
+            TimeSource::Ntp => self.ntp_indicator(),
+            TimeSource::Ethersync => self.link_indicator(),
+        };
+
+        row![
+            text("syncrec").size(22),
+            Space::new().width(Fill),
+            right,
+            Space::new().width(Length::Fixed(12.0)),
+            button(text("Settings").size(12)).on_press(Message::ShowSettings),
+        ]
+        .align_y(Alignment::Center)
+        .into()
+    }
+
+    fn ntp_indicator(&self) -> Element<'_, Message> {
+        let detail = match self.clock_snapshot() {
             Some(s) => {
                 let disp = s
                     .dispersion()
@@ -557,27 +1005,71 @@ impl App {
                     .system_clock_error()
                     .map(|e| format!(" · OS clock {:+.1} ms", e * 1e3))
                     .unwrap_or_default();
-                (s.state, format!("{disp}{ppm}{off} · {} polls", s.accepted))
+                format!("{disp}{ppm}{off} · {} polls", s.accepted)
             }
-            None => (SyncState::Unsynced, "clock unavailable".into()),
+            None => "clock unavailable".into(),
         };
 
-        row![
-            text("syncrec").size(22),
-            Space::new().width(Fill),
-            column![
-                row![
-                    status_dot(state == SyncState::Synced),
-                    text(format!("NTP {}", state.label())).size(13),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center),
-                text(detail).size(11).color(DIM),
+        column![
+            row![
+                status_dot(self.status.synced),
+                text(format!("NTP {}", self.status.label)).size(13),
             ]
-            .align_x(Alignment::End)
-            .spacing(2),
+            .spacing(6)
+            .align_y(Alignment::Center),
+            text(detail).size(11).color(DIM),
         ]
-        .align_y(Alignment::Center)
+        .align_x(Alignment::End)
+        .spacing(2)
+        .into()
+    }
+
+    /// The ethersync corner: which end of the rig this is, and what it can see.
+    ///
+    /// The role lives here rather than in settings because it is the one link
+    /// setting that changes on the day — a machine is promoted to leader because
+    /// another one died, and that should not be four clicks deep.
+    fn link_indicator(&self) -> Element<'_, Message> {
+        let roles = row![
+            radio("Leader", Role::Leader, Some(self.settings.role), Message::RoleSelected)
+                .size(14)
+                .text_size(13)
+                .spacing(5),
+            radio(
+                "Follower",
+                Role::Follower,
+                Some(self.settings.role),
+                Message::RoleSelected
+            )
+            .size(14)
+            .text_size(13)
+            .spacing(5),
+        ]
+        .spacing(14);
+
+        let tc = self
+            .timecode
+            .clone()
+            .unwrap_or_else(|| "--:--:--:--".into());
+
+        let detail = match self.status.dispersion_s {
+            Some(d) => format!("{} · ±{:.2} ms", self.status.source, d * 1e3),
+            None => self.status.source.clone(),
+        };
+
+        column![
+            roles,
+            row![
+                status_dot(self.status.synced),
+                text(tc).size(15).font(iced::Font::MONOSPACE),
+                text(format!("· {}", self.status.label)).size(12).color(DIM),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            text(detail).size(11).color(DIM),
+        ]
+        .align_x(Alignment::End)
+        .spacing(3)
         .into()
     }
 
@@ -586,7 +1078,8 @@ impl App {
             column![
                 text("Microphone access is blocked").size(14),
                 text(self.permission.advice()).size(12).color(DIM),
-                button(text("Open privacy settings").size(12)).on_press(Message::OpenSettings),
+                button(text("Open privacy settings").size(12))
+                    .on_press(Message::OpenPrivacySettings),
             ]
             .spacing(6),
         )
@@ -632,7 +1125,11 @@ impl App {
     }
 
     fn meter_panel(&self) -> Element<'_, Message> {
-        let channels = self.monitor.as_ref().map(|m| m.meters.channels()).unwrap_or(1);
+        let channels = self
+            .monitor
+            .as_ref()
+            .map(|m| m.meters.channels())
+            .unwrap_or(1);
         let data = meter::MeterData::new(&self.peaks, &self.rms, &self.clips);
         let any_clip = self.clips.iter().any(|c| *c);
 
@@ -646,12 +1143,10 @@ impl App {
         // The clip latch only appears once there is something to clear, rather than
         // occupying a permanently dead button.
         if any_clip {
-            stack = stack.push(
-                row![
-                    Space::new().width(Fill),
-                    button(text("Clear clip").size(11)).on_press(Message::ClearClip),
-                ]
-            );
+            stack = stack.push(row![
+                Space::new().width(Fill),
+                button(text("Clear clip").size(11)).on_press(Message::ClearClip),
+            ]);
         }
         stack.into()
     }
@@ -670,33 +1165,16 @@ impl App {
                 .on_input(Message::BaseNameChanged)
                 .size(13)
                 .width(Length::Fixed(160.0)),
-            text(format!("next: {}", self.next_preview)).size(12).color(DIM),
+            text(format!("next: {}", self.next_preview))
+                .size(12)
+                .color(DIM),
         ]
         .spacing(10)
-        .align_y(Alignment::Center);
-
-        let clock_row = row![
-            text_input("pool.ntp.org", &self.ntp_server)
-                .on_input(Message::NtpServerChanged)
-                .on_submit(Message::NtpServerCommitted)
-                .size(13)
-                .width(Length::Fixed(160.0)),
-            button(text("Apply").size(12)).on_press(Message::NtpServerCommitted),
-            Space::new().width(Length::Fixed(20.0)),
-            text("Trim").size(12).color(DIM),
-            text_input("0.0", &self.trim_text)
-                .on_input(Message::TrimChanged)
-                .size(13)
-                .width(Length::Fixed(64.0)),
-            text("ms").size(12).color(DIM),
-        ]
-        .spacing(8)
         .align_y(Alignment::Center);
 
         column![
             labelled("Folder", dir.into()),
             labelled("Name", name.into()),
-            labelled("Clock", clock_row.into()),
         ]
         .spacing(8)
         .into()
@@ -714,8 +1192,17 @@ impl App {
 
         // Recording is never blocked on the clock: missing the moment is worse than
         // an uncorrected take. The button says what you will get instead.
+        //
+        // A follower is the exception, and not because of the clock: its transport
+        // belongs to the leader, so the button is a lamp rather than a control.
         let (label, enabled) = if finalizing {
             ("Finalising…", false)
+        } else if self.slaved() {
+            match (recording, self.rolling) {
+                (true, _) => ("Recording", false),
+                (false, Some(_)) => ("Waiting for leader", false),
+                (false, None) => ("No leader", false),
+            }
         } else if recording {
             ("Stop", true)
         } else if self.monitor.is_none() {
@@ -733,11 +1220,12 @@ impl App {
 
         // One short line, and it lives on its own row. Sharing a row with the
         // transport meant a long message shoved the record button off the window.
-        let status: Element<'_, Message> = match (&self.error, self.clock_hint()) {
+        let hint = (!recording && !finalizing)
+            .then(|| self.status.waiting_for())
+            .flatten();
+        let status: Element<'_, Message> = match (&self.error, hint) {
             (Some(e), _) => text(e.as_str()).size(11).color(ERROR).into(),
-            (None, Some(hint)) if !recording && !finalizing => {
-                text(hint).size(11).color(WARN).into()
-            }
+            (None, Some(hint)) => text(hint).size(11).color(WARN).into(),
             _ => match &self.last_result {
                 Some(msg) => text(msg.as_str()).size(11).color(DIM).into(),
                 None => Space::new().height(Length::Fixed(13.0)).into(),
@@ -757,9 +1245,301 @@ impl App {
         .spacing(6)
         .into()
     }
+
+    // -----------------------------------------------------------------------
+    // Settings
+    // -----------------------------------------------------------------------
+
+    fn settings_view(&self) -> Element<'_, Message> {
+        let header = row![
+            text("Settings").size(22),
+            Space::new().width(Fill),
+            button(text("Done").size(12)).on_press(Message::ShowRecorder),
+        ]
+        .align_y(Alignment::Center);
+
+        let body = column![
+            self.source_section(),
+            rule::horizontal(1),
+            self.ntp_section(),
+            rule::horizontal(1),
+            self.ethersync_section(),
+            rule::horizontal(1),
+            self.input_section(),
+        ]
+        .spacing(16);
+
+        container(
+            column![header, rule::horizontal(1), scrollable(body).height(Fill)].spacing(12),
+        )
+        .padding(18)
+        .width(Fill)
+        .height(Fill)
+        .into()
+    }
+
+    fn source_section(&self) -> Element<'_, Message> {
+        let mut options = column![].spacing(6);
+        for source in TimeSource::ALL {
+            options = options.push(
+                column![
+                    radio(
+                        source.label(),
+                        source,
+                        Some(self.settings.source),
+                        Message::SourceSelected
+                    )
+                    .size(15)
+                    .text_size(14),
+                    row![
+                        Space::new().width(Length::Fixed(24.0)),
+                        text(source.blurb()).size(11).color(DIM),
+                    ],
+                ]
+                .spacing(2),
+            );
+        }
+        section("Time source", options.into())
+    }
+
+    fn ntp_section(&self) -> Element<'_, Message> {
+        let row = row![
+            text_input("pool.ntp.org", &self.settings.ntp_server)
+                .on_input(Message::NtpServerChanged)
+                .on_submit(Message::NtpServerCommitted)
+                .size(13)
+                .width(Length::Fixed(220.0)),
+            button(text("Apply").size(12)).on_press(Message::NtpServerCommitted),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        section(
+            "NTP server",
+            column![
+                row,
+                text(
+                    "Polled every 16 s. A server on the local network is worth an \
+                     order of magnitude over a public pool."
+                )
+                .size(11)
+                .color(DIM),
+            ]
+            .spacing(6)
+            .into(),
+        )
+    }
+
+    fn ethersync_section(&self) -> Element<'_, Message> {
+        let roles = row![
+            radio("Leader", Role::Leader, Some(self.settings.role), Message::RoleSelected)
+                .size(15)
+                .text_size(14),
+            radio(
+                "Follower",
+                Role::Follower,
+                Some(self.settings.role),
+                Message::RoleSelected
+            )
+            .size(15)
+            .text_size(14),
+        ]
+        .spacing(20);
+
+        let rate = row![
+            text("Frame rate").size(13).width(Length::Fixed(90.0)),
+            pick_list(Fps::ALL.to_vec(), Some(self.settings.fps), Message::FpsSelected)
+                .text_size(13)
+                .width(Length::Fixed(110.0)),
+            checkbox(self.settings.drop_frame)
+                .label("Drop frame")
+                .text_size(13)
+                .size(15)
+                .on_toggle_maybe(
+                    self.settings
+                        .fps
+                        .supports_drop_frame()
+                        .then_some(Message::DropFrameToggled)
+                ),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        let body: Element<'_, Message> = match self.settings.role {
+            Role::Leader => self.leader_settings(),
+            Role::Follower => self.follower_settings(),
+        };
+
+        section(
+            "Ethersync",
+            column![
+                roles,
+                rate,
+                text(
+                    "Timecode is the time of day. The leader's transport is the \
+                     record button for the whole rig."
+                )
+                .size(11)
+                .color(DIM),
+                rule::horizontal(1),
+                body,
+            ]
+            .spacing(10)
+            .into(),
+        )
+    }
+
+    fn leader_settings(&self) -> Element<'_, Message> {
+        let fields = row![
+            text("Name").size(13).width(Length::Fixed(90.0)),
+            text_input("syncrec", &self.settings.leader_name)
+                .on_input(Message::LeaderNameChanged)
+                .on_submit(Message::LinkSettingsCommitted)
+                .size(13)
+                .width(Length::Fixed(160.0)),
+            text("Port").size(13),
+            text_input("4443", &self.port_text)
+                .on_input(Message::LeaderPortChanged)
+                .on_submit(Message::LinkSettingsCommitted)
+                .size(13)
+                .width(Length::Fixed(70.0)),
+            button(text("Apply").size(12)).on_press(Message::LinkSettingsCommitted),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        // The bound address is the IPv4 wildcard, so that one leader serves
+        // Ethernet and Wi-Fi at once. `0.0.0.0:4443` is not something an operator
+        // can type into another machine, so show the interfaces instead.
+        let listening = match self.link.as_ref().and_then(|l| l.fingerprint()) {
+            Some(fp) => format!("SHA-256 {fp}"),
+            None => "not listening".into(),
+        };
+        let reachable = if self.endpoints.is_empty() {
+            "no reachable address yet".to_string()
+        } else {
+            let list = self
+                .endpoints
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join("  ");
+            format!("followers can use  {list}")
+        };
+
+        column![
+            fields,
+            text(reachable).size(11),
+            text(listening).size(11).color(DIM),
+            text(
+                "Advertised over mDNS, so followers on the same network find this \
+                 machine without being told an address at all."
+            )
+            .size(11)
+            .color(DIM),
+        ]
+        .spacing(6)
+        .into()
+    }
+
+    fn follower_settings(&self) -> Element<'_, Message> {
+        let fields = row![
+            text("Leader").size(13).width(Length::Fixed(90.0)),
+            text_input("(discover automatically)", &self.settings.follower_address)
+                .on_input(Message::FollowerAddressChanged)
+                .on_submit(Message::LinkSettingsCommitted)
+                .size(13)
+                .width(Length::Fixed(220.0)),
+            button(text("Apply").size(12)).on_press(Message::LinkSettingsCommitted),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let mut found = column![].spacing(4);
+        if self.settings.follower_socket().is_none() {
+            if self.discovered.is_empty() {
+                found = found.push(text("browsing for leaders…").size(11).color(DIM));
+            }
+            for leader in &self.discovered {
+                let Some(address) = leader
+                    .addresses
+                    .iter()
+                    .find(|a| a.is_ipv4())
+                    .or_else(|| leader.addresses.first())
+                else {
+                    continue;
+                };
+                found = found.push(
+                    row![
+                        text(format!("{} · {address}", leader.name)).size(12),
+                        Space::new().width(Fill),
+                        button(text("Use").size(11))
+                            .on_press(Message::UseDiscovered(address.to_string())),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
+            }
+        }
+
+        let connected = match self.link.as_ref().and_then(|l| l.address()) {
+            Some(addr) => format!("locked to {addr} · {}", self.status.label),
+            None => "no leader yet".into(),
+        };
+
+        column![
+            fields,
+            text(connected).size(11).color(DIM),
+            found,
+            text(
+                "Leave the address empty to take the first leader discovered on \
+                 the network. Recording follows the leader; this machine's record \
+                 button is disabled."
+            )
+            .size(11)
+            .color(DIM),
+        ]
+        .spacing(6)
+        .into()
+    }
+
+    fn input_section(&self) -> Element<'_, Message> {
+        let platform = InputLatency::query(self.selected.as_ref().map(|d| d.name.as_str()));
+        let trim = row![
+            text("Trim").size(13).width(Length::Fixed(90.0)),
+            text_input("0.0", &self.trim_text)
+                .on_input(Message::TrimChanged)
+                .size(13)
+                .width(Length::Fixed(70.0)),
+            text("ms").size(12).color(DIM),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        section(
+            "Input latency",
+            column![
+                trim,
+                text(platform.describe()).size(11).color(DIM),
+                text(
+                    "Added to the platform figure and subtracted from every \
+                     timestamp. Positive pulls the take earlier."
+                )
+                .size(11)
+                .color(DIM),
+            ]
+            .spacing(6)
+            .into(),
+        )
+    }
 }
 
 const LABEL_W: f32 = 64.0;
+
+/// A titled block on the settings page.
+fn section<'a>(title: &'a str, body: Element<'a, Message>) -> Element<'a, Message> {
+    column![text(title).size(15), body].spacing(8).into()
+}
 
 /// Diameter of the sync indicator.
 const DOT: f32 = 9.0;
@@ -844,6 +1624,25 @@ fn labelled<'a>(label: &'a str, content: Element<'a, Message>) -> Element<'a, Me
     .into()
 }
 
+/// A reference that is not there yet. Never `synced`, so nothing downstream can
+/// mistake "we have not started looking" for "the clock is fine".
+fn offline_status(label: &str) -> RefStatus {
+    RefStatus {
+        kind: "clock",
+        source: "no clock".into(),
+        synced: false,
+        label: label.into(),
+        samples: None,
+        discarded: None,
+        dispersion_s: None,
+        slope_ppm: None,
+    }
+}
+
+fn format_trim(ms: f64) -> String {
+    format!("{ms:.1}")
+}
+
 fn file_name(p: &std::path::Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -864,12 +1663,10 @@ fn dirs_audio_fallback() -> PathBuf {
 }
 
 /// Turn a finished take into the file that ships.
-fn finalize_take(
-    sidecar: &Sidecar,
-    paths: &TakePaths,
-    snapshot: Option<ClockSnapshot>,
-    trim_ms: f64,
-) -> anyhow::Result<Outcome> {
+fn finalize_take(take: &session::TakeResult, trim_ms: f64) -> anyhow::Result<Outcome> {
+    let sidecar: &Sidecar = &take.sidecar;
+    let paths: &TakePaths = &take.paths;
+
     // Without an anchor we still have to write something, but it must be visibly
     // untrusted rather than quietly wrong.
     let (t0, sync_state) = match sidecar.t0_unix_nanos {
@@ -882,6 +1679,14 @@ fn finalize_take(
         ),
     };
 
+    // A timecode stamp only means anything when the anchor it labels is real, so
+    // it rides on `t0` having resolved rather than on the reference having a rate.
+    let timecode = sidecar
+        .t0_unix_nanos
+        .and(take.timecode)
+        .zip(sidecar.start_timecode.clone())
+        .map(|(format, start)| TimecodeStamp { format, start });
+
     let provenance = Provenance {
         t0_unix_nanos: t0,
         sample_rate: audio::TARGET_RATE,
@@ -892,14 +1697,13 @@ fn finalize_take(
         measured_rate: None,
         drift_ratio: None,
         resampled: false,
-        ntp_server: sidecar.ntp_server.clone(),
-        ntp_dispersion_s: sidecar.ntp_dispersion_s,
+        clock_source: sidecar.clock_source.clone(),
+        clock_dispersion_s: sidecar.clock_dispersion_s,
         sync_state,
         slope_ppm: sidecar.clock_slope_ppm,
         latency_offset_ms: trim_ms,
+        timecode,
     };
-
-    let clock = snapshot.unwrap_or_else(|| ClockModel::new(Instant::now()).snapshot());
 
     // Correction is not optional. Whether it is actually applied is the safety
     // gate's decision, made from the measurements, not a switch in the window.
@@ -907,12 +1711,12 @@ fn finalize_take(
         &paths.raw,
         &paths.final_wav,
         &sidecar.observations,
-        &clock,
+        &take.status,
         &provenance,
     )?;
 
     // The Broadcast Wave file already carries t0, the measured rate, the drift
-    // ratio, the NTP server and the dispersion in its CodingHistory and iXML. The
+    // ratio, the clock source and the dispersion in its CodingHistory and iXML. The
     // sidecar adds only the raw per-observation rows the fit was derived from, so
     // on a clean take it is redundant and a successful take should leave exactly
     // one file. When the gate fails it is the evidence for why, and it stays put
@@ -952,7 +1756,17 @@ mod tests {
 
     #[test]
     fn file_name_survives_a_bare_path() {
-        assert_eq!(file_name(std::path::Path::new("/tmp/rec-3.wav")), "rec-3.wav");
+        assert_eq!(
+            file_name(std::path::Path::new("/tmp/rec-3.wav")),
+            "rec-3.wav"
+        );
         assert_eq!(file_name(std::path::Path::new("")), "");
+    }
+
+    #[test]
+    fn an_absent_reference_never_reads_as_ready() {
+        let s = offline_status("no link");
+        assert!(!s.synced);
+        assert!(!s.ready());
     }
 }

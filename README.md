@@ -17,6 +17,65 @@ the full audit trail.
 Target accuracy: sub-millisecond over Ethernet, 5–20 ms over WiFi (bounded by
 network path asymmetry, which no amount of software can observe).
 
+## Two ways to know what time it is
+
+Settings offers a choice of time source, and it is a choice between two different
+questions.
+
+**NTP** answers *what time is it really?* Every recorder answers it separately, so
+two machines agree only as well as their two independent network paths allow. It
+is the right answer for a lone recorder, and for anything that has to line up with
+the rest of the world rather than with the machine next to it.
+
+**Ethersync** answers *what time does the leader think it is?* — LAN timecode from
+[ethersync](https://github.com/coral/ethersync). That is a worse question to ask of
+the universe and a much better one to ask of a rig: every follower is wrong by the
+same amount, so the takes line up with each other *exactly*, which is the property
+a multi-recorder shoot actually needs. On loopback the two ends agree to under
+0.15 ms; see `tests/ethersync_link.rs`, which measures it.
+
+Everything downstream of the capture path is indifferent to which one is running.
+Both answer the same single question — *what UTC was this `Instant`?* — so the
+drift log, the drift fit, the safety gate and the file writer never learn that the
+clock changed underneath them.
+
+## Ethersync: leader and follower
+
+The role switch lives in the top right of the recording window, not four clicks
+deep in settings, because a machine gets promoted to leader on the day — usually
+because another one just died.
+
+**Leader.** This machine drives the rig. Pressing record anchors the timeline to
+the local time of day and starts it; pressing stop pauses it. The transport *is*
+the record state, so there is no second channel to get out of step with the audio.
+It advertises over mDNS, so followers find it without being told an address.
+
+**Follower.** This machine's record button is a lamp, not a control. It watches
+the leader's transport: when the leader rolls, it opens a new take; when the leader
+stops, that take finalises exactly as if the button had been pressed here. Offering
+a local override would only ever produce a take that does not line up with the
+others. Leave the leader address empty and it takes the first leader the LAN
+offers, pinning the certificate fingerprint from the same mDNS record.
+
+Timecode is time of day, the way production sound has always done it. That is what
+lets `bext.TimeReference`, `OriginationDate`, `OriginationTime` and `t0` all stay
+honest: the timeline resolves to a real instant on the calendar rather than to an
+offset from an arbitrary origin. A take crossing midnight is handled by picking the
+whole day nearest to where the monotonic clock says we should be, so the label
+wrapping at 24 hours does not drag the file back to yesterday morning.
+
+The frame rate only ever affects the *label*. Drop-frame renumbering included:
+position over frame rate is the real offset into the day in both numbering schemes,
+so a 29.97 DF rig and a 25 fps rig stamp the same instant identically.
+
+The one honesty cost is worth stating plainly. A leader has no NTP, so its idea of
+the time of day comes from its own OS clock — the very clock this program exists
+not to trust. It is used for one thing only, and to hours of precision: deciding
+which second of which day the rig is anchored to. From that anchor on, every
+follower is locked to the leader's *monotonic* clock, not to anybody's wall clock.
+Absolute accuracy is the leader's OS clock; relative accuracy across the rig is
+ethersync's, which is far better. Pick NTP if it is the first number you care about.
+
 ## Build and run
 
 ```sh
@@ -85,7 +144,9 @@ cargo run --example record-probe -- 25 time.apple.com
 ```
 
 Runs SNTP → clock model → device → ring buffer → writer thread → WAV + sidecar and
-reports the device's measured rate.
+reports the device's measured rate. NTP only; the ethersync path is covered by
+`cargo test --test ethersync_link`, which stands a leader and a follower up on
+loopback and checks that they agree about UTC and that the transport carries.
 
 ## What a take produces
 
@@ -95,9 +156,11 @@ A take that corrects cleanly leaves **one file**:
 rec-1.wav        the Broadcast Wave file
 ```
 
-`t0` to the nanosecond, the measured sample rate, the drift ratio, the NTP server,
-the sync state and the dispersion all travel inside it, in `bext` `CodingHistory`
-and in iXML. Nothing else is needed to interpret the take.
+`t0` to the nanosecond, the measured sample rate, the drift ratio, the clock
+source, the sync state and the dispersion all travel inside it, in `bext`
+`CodingHistory` and in iXML. A take stamped from timecode also carries its frame
+rate, its drop-frame flag and its start timecode, which `bext.TimeReference` cannot
+express because it counts samples. Nothing else is needed to interpret the take.
 
 A take that could *not* be corrected keeps its evidence instead:
 
@@ -117,7 +180,15 @@ bits exactly once, after resampling, rather than twice.
 The corrected file replaces the original, so the correction has to be trustworthy
 before the raw capture is deleted. All of these must hold:
 
-- the clock reached `Synced` with at least 3 accepted SNTP exchanges
+- the time reference reported itself synced — `Synced` for the clock model,
+  `Synchronized` for an ethersync follower
+- at least 3 accepted clock exchanges, *when the reference counts exchanges at
+  all*. An ethersync follower counts its own and is held to exactly the same
+  three, so neither source gets in on a single lucky sample. An ethersync leader
+  generates the timeline it is being judged against and has nobody to exchange
+  with, so for a leader the criterion is skipped rather than satisfied with a
+  made-up number. Being skipped is not a way past the gate: an unsynced reference
+  still fails the condition above.
 - at least 30 drift observations
 - spanning at least 20 seconds
 - `|drift|` under 200 ppm measured against the device's own nominal rate
@@ -148,10 +219,19 @@ nothing worth correcting and no way to measure it if there were.
 
 ```
 src/clock/       the clock model: SNTP polling, the 8-sample fit, the audio-clock bridge
+src/clock/reference.rs  the interface both time sources answer to
+src/ethersync.rs LAN timecode: the engine, time-of-day conversion, leader and follower
+src/settings.rs  the settings page's state, and where it lives between launches
 src/audio/       device negotiation, the realtime capture callback, metering, the writer thread
 src/bwf.rs       bext / iXML construction and the TimeReference maths
 src/finalize.rs  drift fitting, resampling, the safety gate
 src/latency.rs   platform input-latency correction
 src/permission.rs microphone permission
 src/ui/          the iced front end
+```
+
+Ethersync is a path dependency on a sibling checkout until it is published:
+
+```toml
+libethersync = { path = "../ethersync/native" }
 ```

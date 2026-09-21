@@ -38,11 +38,12 @@ fn provenance(t0: i128, channels: u16) -> Provenance {
         measured_rate: Some(47_999.4),
         drift_ratio: Some(48_000.0 / 47_999.4),
         resampled: true,
-        ntp_server: "time.apple.com".into(),
-        ntp_dispersion_s: Some(0.004928),
+        clock_source: "time.apple.com".into(),
+        clock_dispersion_s: Some(0.004928),
         sync_state: "synced".into(),
         slope_ppm: Some(-16.28),
         latency_offset_ms: 0.0,
+        timecode: None,
     }
 }
 
@@ -141,7 +142,7 @@ fn coding_history_carries_the_drift_numbers_into_the_file() {
     );
     for needle in [
         "drift_ratio:1.000012500",
-        "ntp_dispersion_ms:4.928",
+        "clock_dispersion_ms:4.928",
         "resampled:yes",
     ] {
         assert!(
@@ -171,7 +172,7 @@ fn ixml_survives_the_round_trip_as_well_formed_xml() {
         "{text}"
     );
     assert!(
-        text.contains("<NTP_SYNC_STATE>synced</NTP_SYNC_STATE>"),
+        text.contains("<CLOCK_SYNC_STATE>synced</CLOCK_SYNC_STATE>"),
         "{text}"
     );
 }
@@ -288,7 +289,7 @@ fn an_unsynced_take_is_labelled_as_such_in_the_file() {
     let path = scratch("unsynced.wav");
     let mut p = provenance(at_local(3, 0, 0, 0), 2);
     p.sync_state = "unsynced".into();
-    p.ntp_dispersion_s = None;
+    p.clock_dispersion_s = None;
     p.measured_rate = None;
     p.drift_ratio = None;
     p.resampled = false;
@@ -297,7 +298,7 @@ fn an_unsynced_take_is_labelled_as_such_in_the_file() {
     let mut r = WaveReader::open(&path).unwrap();
     let bext = r.broadcast_extension().unwrap().unwrap();
     // Someone opening this file must be able to tell the timestamp is not trusted.
-    assert!(bext.coding_history.contains("ntp_sync:unsynced"));
-    assert!(bext.coding_history.contains("ntp_dispersion_ms:unknown"));
+    assert!(bext.coding_history.contains("clock_sync:unsynced"));
+    assert!(bext.coding_history.contains("clock_dispersion_ms:unknown"));
     assert!(bext.coding_history.contains("resampled:no"));
 }

@@ -9,7 +9,7 @@
 //! sidecar the moment it becomes known so a crash does not lose it.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use bwavfile::{AudioFrameWriter, WaveWriter};
 use super::capture::Capture;
 use super::writer::{DriftLog, Sidecar, TakePaths};
 use crate::bwf;
-use crate::clock::ClockModel;
+use crate::clock::{RefStatus, Reference, TimecodeFormat};
 use crate::latency::LatencyCorrection;
 
 /// How long the writer sleeps when there is nothing to do. Short enough that a
@@ -31,7 +31,6 @@ const DRAIN_FRAMES: usize = 16_384;
 pub struct SessionConfig {
     pub paths: TakePaths,
     pub device_name: String,
-    pub ntp_server: String,
     /// Platform latency still unaccounted for, plus any manual trim.
     pub latency: LatencyCorrection,
 }
@@ -40,6 +39,15 @@ pub struct SessionConfig {
 pub struct TakeResult {
     pub paths: TakePaths,
     pub sidecar: Sidecar,
+    /// What the time reference thought of itself when the take ended.
+    ///
+    /// Captured here rather than re-read afterwards so that finalising judges the
+    /// take against the clock that actually timestamped it, not against whatever
+    /// the clock has become by the time the resampler gets round to it.
+    pub status: RefStatus,
+    /// The frame rate the timecode was carried at. A follower reports what the
+    /// leader was actually running, which need not be what this machine was set to.
+    pub timecode: Option<TimecodeFormat>,
 }
 
 /// Live counters the UI can read without touching the writer thread.
@@ -100,9 +108,13 @@ impl Drop for Recording {
 }
 
 /// Start capturing. The returned handle owns the stream until it is stopped.
+///
+/// `reference` is whatever this take is being timestamped against — the SNTP model
+/// or an ethersync timeline — and the writer thread owns it outright for the life
+/// of the take, because resolving a mark from an ethersync reader mutates it.
 pub fn start(
     capture: Capture,
-    clock: Arc<Mutex<ClockModel>>,
+    reference: Box<dyn Reference>,
     config: SessionConfig,
 ) -> Result<Recording> {
     let rate = capture.negotiated.rate;
@@ -117,7 +129,7 @@ pub fn start(
         let progress = Arc::clone(&progress);
         thread::Builder::new()
             .name("syncrec-writer".into())
-            .spawn(move || run(capture, clock, config, stop, progress))
+            .spawn(move || run(capture, reference, config, stop, progress))
             .context("spawning the writer thread")?
     };
 
@@ -132,7 +144,7 @@ pub fn start(
 
 fn run(
     mut capture: Capture,
-    clock: Arc<Mutex<ClockModel>>,
+    mut reference: Box<dyn Reference>,
     config: SessionConfig,
     stop: Arc<AtomicBool>,
     progress: Arc<Progress>,
@@ -163,24 +175,23 @@ fn run(
             let _ = capture.pause();
         }
 
-        let snapshot = clock.lock().map(|m| m.snapshot()).ok();
+        // One refresh per pass, so every mark in a pass is resolved against the
+        // same state rather than against a clock that moved mid-loop.
+        reference.refresh();
+        while let Ok(mark) = capture.marks.pop() {
+            drift.observe(mark, &*reference);
+        }
+        drift.retry_pending(&*reference);
+        progress
+            .observations
+            .store(drift.observations().len() as u64, Ordering::Relaxed);
 
-        if let Some(snap) = snapshot {
-            while let Ok(mark) = capture.marks.pop() {
-                drift.observe(mark, &snap);
-            }
-            drift.retry_pending(&snap);
-            progress
-                .observations
-                .store(drift.observations().len() as u64, Ordering::Relaxed);
-
-            // Flush the anchor as soon as it exists, so a crash mid-take still
-            // leaves behind the one fact that cannot be recovered afterwards.
-            if !anchor_flushed && drift.t0_unix_nanos().is_some() {
-                let partial = build_sidecar(&config, &drift, &snap, rate, channels, raw_frames, 0);
-                if partial.write(&config.paths.sidecar).is_ok() {
-                    anchor_flushed = true;
-                }
+        // Flush the anchor as soon as it exists, so a crash mid-take still
+        // leaves behind the one fact that cannot be recovered afterwards.
+        if !anchor_flushed && drift.t0_unix_nanos().is_some() {
+            let partial = build_sidecar(&config, &drift, &*reference, rate, channels, raw_frames, 0);
+            if partial.write(&config.paths.sidecar).is_ok() {
+                anchor_flushed = true;
             }
         }
 
@@ -205,14 +216,13 @@ fn run(
 
     frames.end().context("closing the audio data chunk")?;
 
-    let snap = clock
-        .lock()
-        .map(|m| m.snapshot())
-        .map_err(|_| anyhow::anyhow!("clock mutex poisoned"))?;
+    reference.refresh();
+    let status = reference.status();
+    let timecode = reference.timecode_format();
     let mut sidecar = build_sidecar(
         &config,
         &drift,
-        &snap,
+        &*reference,
         rate,
         channels,
         raw_frames,
@@ -224,6 +234,8 @@ fn run(
     Ok(TakeResult {
         paths: config.paths,
         sidecar,
+        status,
+        timecode,
     })
 }
 
@@ -262,24 +274,29 @@ fn drain_audio(
 fn build_sidecar(
     config: &SessionConfig,
     drift: &DriftLog,
-    snap: &crate::clock::ClockSnapshot,
+    reference: &dyn Reference,
     rate: u32,
     channels: u16,
     raw_frames: u64,
     overruns: u64,
 ) -> Sidecar {
+    let status = reference.status();
+    let t0 = drift.t0_unix_nanos();
     Sidecar {
-        t0_unix_nanos: drift.t0_unix_nanos(),
+        t0_unix_nanos: t0,
         device_name: config.device_name.clone(),
         device_rate: rate,
         channels,
         raw_frames,
-        ntp_server: config.ntp_server.clone(),
-        sync_state: snap.state.label().to_string(),
-        ntp_dispersion_s: snap.dispersion(),
-        clock_slope_ppm: snap.fit().filter(|f| f.slope_trusted).map(|f| f.ppm()),
-        clock_samples_accepted: snap.accepted,
-        clock_samples_rejected: snap.rejected,
+        clock_source: status.source,
+        sync_state: status.label,
+        clock_dispersion_s: status.dispersion_s,
+        clock_slope_ppm: status.slope_ppm,
+        clock_samples_accepted: status.samples,
+        clock_samples_rejected: status.discarded,
+        start_timecode: t0
+            .zip(reference.timecode_format())
+            .and_then(|(t0, tc)| crate::ethersync::label_at(t0, tc)),
         latency_trim_ms: config.latency.trim_ms(),
         overruns,
         marks_abandoned: drift.abandoned_count(),

@@ -12,6 +12,8 @@ use bwavfile::{
 };
 use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 
+use crate::clock::TimecodeFormat;
+
 /// The largest `f32` that survives conversion to 24-bit integer PCM.
 ///
 /// 24-bit samples run to `2^23 - 1` on the positive side but `-2^23` on the
@@ -104,6 +106,18 @@ pub fn wave_fmt_f32(sample_rate: u32, channels: u16) -> WaveFmt {
     wave_fmt(sample_rate, channels, 32, true)
 }
 
+/// The timecode a take was stamped against, when it came from a timecode source.
+///
+/// `bext.TimeReference` counts samples and so cannot carry a frame rate, which is
+/// the first thing anyone conforming a multicam shoot asks for. It goes in iXML and
+/// in `CodingHistory` instead.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimecodeStamp {
+    pub format: TimecodeFormat,
+    /// The label at `t0`, as it reads on a slate.
+    pub start: String,
+}
+
 /// What we know about how a take was made. Travels into `bext`, iXML and the sidecar.
 #[derive(Debug, Clone)]
 pub struct Provenance {
@@ -122,14 +136,18 @@ pub struct Provenance {
     pub drift_ratio: Option<f64>,
     /// Whether the audio was actually resampled by that ratio.
     pub resampled: bool,
-    pub ntp_server: String,
+    /// What the timestamps were measured against: an NTP server, or the ethersync
+    /// leader this machine was locked to.
+    pub clock_source: String,
     /// Best estimate of our timestamp error, in seconds.
-    pub ntp_dispersion_s: Option<f64>,
+    pub clock_dispersion_s: Option<f64>,
     pub sync_state: String,
     /// Machine frequency error from the clock fit, if it was trustworthy.
     pub slope_ppm: Option<f64>,
     /// Manual latency trim the operator dialled in, in milliseconds.
     pub latency_offset_ms: f64,
+    /// The timecode at `t0`, when the clock was a timecode source.
+    pub timecode: Option<TimecodeStamp>,
 }
 
 /// Samples since local midnight at `t0` — the value `bext.TimeReference` wants.
@@ -198,15 +216,19 @@ pub fn coding_history(p: &Provenance) -> String {
         "\r\nT=resampled:{}",
         if p.resampled { "yes" } else { "no" }
     ));
-    s.push_str(&format!("\r\nT=ntp_server:{}", p.ntp_server));
-    s.push_str(&format!("\r\nT=ntp_sync:{}", p.sync_state));
-    if let Some(d) = p.ntp_dispersion_s {
-        s.push_str(&format!("\r\nT=ntp_dispersion_ms:{:.3}", d * 1.0e3));
+    s.push_str(&format!("\r\nT=clock_source:{}", p.clock_source));
+    s.push_str(&format!("\r\nT=clock_sync:{}", p.sync_state));
+    if let Some(d) = p.clock_dispersion_s {
+        s.push_str(&format!("\r\nT=clock_dispersion_ms:{:.3}", d * 1.0e3));
     } else {
-        s.push_str("\r\nT=ntp_dispersion_ms:unknown");
+        s.push_str("\r\nT=clock_dispersion_ms:unknown");
     }
     if let Some(ppm) = p.slope_ppm {
         s.push_str(&format!("\r\nT=clock_slope_ppm:{ppm:.3}"));
+    }
+    if let Some(tc) = &p.timecode {
+        s.push_str(&format!("\r\nT=timecode_rate:{}", tc.format));
+        s.push_str(&format!("\r\nT=start_timecode:{}", tc.start));
     }
     s.push_str(&format!("\r\nT=latency_trim_ms:{:.3}", p.latency_offset_ms));
     s.push_str(&format!("\r\nT=t0_utc:{}", iso8601_nanos(p.t0_unix_nanos)));
@@ -233,10 +255,11 @@ pub fn ixml(p: &Provenance) -> String {
 <BWFXML>
   <IXML_VERSION>1.61</IXML_VERSION>
   <PROJECT>syncrec</PROJECT>
-  <NOTE>Timestamps derived from in-process SNTP against a monotonic clock, not the OS wall clock.</NOTE>
+  <NOTE>{note}</NOTE>
   <SPEED>
     <MASTER_SPEED>{rate}/1</MASTER_SPEED>
-    <TIMECODE_RATE>{rate}/1</TIMECODE_RATE>
+    <TIMECODE_RATE>{tc_rate}</TIMECODE_RATE>
+    <TIMECODE_FLAG>{tc_flag}</TIMECODE_FLAG>
     <FILE_SAMPLE_RATE>{rate}</FILE_SAMPLE_RATE>
   </SPEED>
   <SYNCREC>
@@ -249,15 +272,32 @@ pub fn ixml(p: &Provenance) -> String {
     <MEASURED_RATE>{measured}</MEASURED_RATE>
     <DRIFT_RATIO>{ratio}</DRIFT_RATIO>
     <RESAMPLED>{resampled}</RESAMPLED>
-    <NTP_SERVER>{server}</NTP_SERVER>
-    <NTP_SYNC_STATE>{sync}</NTP_SYNC_STATE>
-    <NTP_DISPERSION_MS>{disp}</NTP_DISPERSION_MS>
+    <CLOCK_SOURCE>{server}</CLOCK_SOURCE>
+    <CLOCK_SYNC_STATE>{sync}</CLOCK_SYNC_STATE>
+    <CLOCK_DISPERSION_MS>{disp}</CLOCK_DISPERSION_MS>
     <CLOCK_SLOPE_PPM>{ppm}</CLOCK_SLOPE_PPM>
+    <START_TIMECODE>{start_tc}</START_TIMECODE>
     <LATENCY_TRIM_MS>{trim:.3}</LATENCY_TRIM_MS>
   </SYNCREC>
 </BWFXML>
 "#,
         rate = p.sample_rate,
+        note = match &p.timecode {
+            Some(_) => "Timestamps derived from LAN timecode (ethersync), not the OS wall clock.",
+            None => "Timestamps derived from in-process SNTP against a monotonic clock, not the OS wall clock.",
+        },
+        // iXML wants the *timecode* rate here. Without a timecode source there is
+        // no frame rate to report, and the sample rate is the only honest stand-in
+        // for a file whose timestamps are counted in samples.
+        tc_rate = match &p.timecode {
+            Some(tc) => format!("{}/{}", tc.format.numerator, tc.format.denominator),
+            None => format!("{}/1", p.sample_rate),
+        },
+        tc_flag = match &p.timecode {
+            Some(tc) if tc.format.drop_frame => "DF",
+            _ => "NDF",
+        },
+        start_tc = p.timecode.as_ref().map(|tc| tc.start.as_str()).unwrap_or_default(),
         t0 = iso8601_nanos(p.t0_unix_nanos),
         date = date,
         time = time,
@@ -267,9 +307,9 @@ pub fn ixml(p: &Provenance) -> String {
         measured = opt(p.measured_rate, 4),
         ratio = opt(p.drift_ratio, 9),
         resampled = if p.resampled { "true" } else { "false" },
-        server = xml_escape(&p.ntp_server),
+        server = xml_escape(&p.clock_source),
         sync = xml_escape(&p.sync_state),
-        disp = opt(p.ntp_dispersion_s.map(|d| d * 1.0e3), 3),
+        disp = opt(p.clock_dispersion_s.map(|d| d * 1.0e3), 3),
         ppm = opt(p.slope_ppm, 3),
         trim = p.latency_offset_ms,
     )
@@ -295,7 +335,7 @@ pub fn bext(p: &Provenance) -> Bext {
                 channel_mode(p.channels),
                 p.sample_rate,
                 iso8601_nanos(p.t0_unix_nanos),
-                match p.ntp_dispersion_s {
+                match p.clock_dispersion_s {
                     Some(d) => format!("{:.3}ms", d * 1.0e3),
                     None => "unknown".into(),
                 }
@@ -342,11 +382,12 @@ mod tests {
             measured_rate: Some(47_999.4),
             drift_ratio: Some(48_000.0 / 47_999.4),
             resampled: true,
-            ntp_server: "time.apple.com".into(),
-            ntp_dispersion_s: Some(0.004928),
+            clock_source: "time.apple.com".into(),
+            clock_dispersion_s: Some(0.004928),
             sync_state: "synced".into(),
             slope_ppm: Some(-16.28),
             latency_offset_ms: 0.0,
+            timecode: None,
         }
     }
 
@@ -423,8 +464,9 @@ mod tests {
             "drift_ratio:1.000012500",
             "measured_rate:47999.4000",
             "resampled:yes",
-            "ntp_dispersion_ms:4.928",
-            "ntp_sync:synced",
+            "clock_dispersion_ms:4.928",
+            "clock_sync:synced",
+            "clock_source:time.apple.com",
             "clock_slope_ppm:-16.280",
         ] {
             assert!(h.contains(needle), "missing {needle} in:\n{h}");
@@ -434,11 +476,45 @@ mod tests {
     #[test]
     fn unsynced_takes_say_so_rather_than_inventing_a_dispersion() {
         let mut p = provenance();
-        p.ntp_dispersion_s = None;
+        p.clock_dispersion_s = None;
         p.sync_state = "unsynced".into();
         let h = coding_history(&p);
-        assert!(h.contains("ntp_dispersion_ms:unknown"), "{h}");
-        assert!(h.contains("ntp_sync:unsynced"), "{h}");
+        assert!(h.contains("clock_dispersion_ms:unknown"), "{h}");
+        assert!(h.contains("clock_sync:unsynced"), "{h}");
+    }
+
+    #[test]
+    fn a_timecode_take_carries_its_frame_rate_and_start() {
+        let p = Provenance {
+            clock_source: "ethersync follower of 10.0.0.4:4443".into(),
+            timecode: Some(TimecodeStamp {
+                format: TimecodeFormat {
+                    numerator: 30000,
+                    denominator: 1001,
+                    drop_frame: true,
+                },
+                start: "10:31:07;12".into(),
+            }),
+            ..provenance()
+        };
+        let h = coding_history(&p);
+        assert!(h.contains("T=start_timecode:10:31:07;12"), "{h}");
+        assert!(h.contains("T=timecode_rate:29.970 DF"), "{h}");
+        assert!(h.contains("T=clock_source:ethersync follower of"), "{h}");
+
+        let x = ixml(&p);
+        // Sample rate is not a frame rate. A conform that reads 48000/1 here puts
+        // the take four hundred hours away from where it belongs.
+        assert!(x.contains("<TIMECODE_RATE>30000/1001</TIMECODE_RATE>"), "{x}");
+        assert!(x.contains("<TIMECODE_FLAG>DF</TIMECODE_FLAG>"), "{x}");
+        assert!(x.contains("<START_TIMECODE>10:31:07;12</START_TIMECODE>"), "{x}");
+    }
+
+    #[test]
+    fn an_ntp_take_claims_no_timecode_rate_it_does_not_have() {
+        let x = ixml(&provenance());
+        assert!(x.contains("<TIMECODE_FLAG>NDF</TIMECODE_FLAG>"), "{x}");
+        assert!(x.contains("<START_TIMECODE></START_TIMECODE>"), "{x}");
     }
 
     #[test]

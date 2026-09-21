@@ -16,6 +16,11 @@
 //! Marks taken before the clock has synced cannot be resolved at all, so they are
 //! parked and retried. That matters most for the very first mark, which is the
 //! recording's anchor.
+//!
+//! Nothing here knows or cares whether the UTC came from NTP or from an ethersync
+//! timecode leader. Both answer the same one question — what UTC was this
+//! `Instant`? — which is the entire reason a second time source could be added
+//! without touching the drift fit, the safety gate or the file writer.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -24,7 +29,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::capture::TimeMark;
-use crate::clock::ClockSnapshot;
+use crate::clock::Reference;
 use crate::clock::bridge::Bridge;
 use crate::latency::LatencyCorrection;
 
@@ -80,9 +85,9 @@ impl DriftLog {
     }
 
     /// Feed one mark. It is resolved immediately if the clock can place it.
-    pub fn observe(&mut self, mark: TimeMark, clock: &ClockSnapshot) {
+    pub fn observe(&mut self, mark: TimeMark, clock: &dyn Reference) {
         let at = self.mark_instant(mark);
-        match clock.utc_nanos_at(at) {
+        match clock.utc_nanos(at) {
             Some(utc) => self.resolved.push(DriftObservation {
                 sample_index: mark.frame_index,
                 utc_unix_nanos: self.latency.apply(utc),
@@ -101,14 +106,14 @@ impl DriftLog {
     ///
     /// Resolved marks are appended in sample order so the drift fit sees a tidy
     /// series regardless of how long they waited.
-    pub fn retry_pending(&mut self, clock: &ClockSnapshot) {
+    pub fn retry_pending(&mut self, clock: &dyn Reference) {
         if self.pending.is_empty() {
             return;
         }
         let mut still_pending = Vec::new();
         let mut freshly_resolved = Vec::new();
         for (index, at) in self.pending.drain(..) {
-            match clock.utc_nanos_at(at) {
+            match clock.utc_nanos(at) {
                 Some(utc) => freshly_resolved.push(DriftObservation {
                     sample_index: index,
                     utc_unix_nanos: self.latency.apply(utc),
@@ -227,12 +232,18 @@ pub struct Sidecar {
     pub device_rate: u32,
     pub channels: u16,
     pub raw_frames: u64,
-    pub ntp_server: String,
+    /// What the timestamps were measured against: an NTP server, or the ethersync
+    /// leader this machine was locked to.
+    pub clock_source: String,
     pub sync_state: String,
-    pub ntp_dispersion_s: Option<f64>,
+    pub clock_dispersion_s: Option<f64>,
     pub clock_slope_ppm: Option<f64>,
-    pub clock_samples_accepted: u64,
-    pub clock_samples_rejected: u64,
+    /// Absent for a reference with nothing to exchange, such as a leader.
+    pub clock_samples_accepted: Option<u64>,
+    pub clock_samples_rejected: Option<u64>,
+    /// The timecode this take started at, when it came from a timecode source.
+    #[serde(default)]
+    pub start_timecode: Option<String>,
     pub latency_trim_ms: f64,
     pub overruns: u64,
     pub marks_abandoned: u64,
@@ -258,7 +269,7 @@ impl Sidecar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::ClockModel;
+    use crate::clock::{ClockModel, ClockSnapshot, NtpReference};
     use crate::latency::InputLatency;
     use std::time::Duration;
     use cpal::StreamInstant;
@@ -299,6 +310,12 @@ mod tests {
         (bridge, now_stream, Instant::now())
     }
 
+    /// A reference frozen at `snapshot`, which is what these tests want: a clock
+    /// that cannot move underneath an assertion.
+    fn reference(snapshot: ClockSnapshot) -> NtpReference {
+        NtpReference::fixed("test".into(), snapshot)
+    }
+
     /// A clock synced enough to resolve timestamps, anchored at `base`.
     fn synced_clock(base: Instant) -> ClockSnapshot {
         let mut m = ClockModel::new(base);
@@ -324,7 +341,7 @@ mod tests {
     #[test]
     fn a_resolvable_mark_becomes_an_observation() {
         let (bridge, now_stream, now) = rig();
-        let clock = synced_clock(now);
+        let clock = reference(synced_clock(now));
         let mut log = DriftLog::new(
             bridge,
             LatencyCorrection::platform_only(InputLatency::already_corrected()),
@@ -338,7 +355,7 @@ mod tests {
     #[test]
     fn marks_taken_before_sync_are_parked_not_discarded() {
         let (bridge, now_stream, now) = rig();
-        let unsynced = ClockModel::new(now).snapshot();
+        let unsynced = reference(ClockModel::new(now).snapshot());
         let mut log = DriftLog::new(
             bridge,
             LatencyCorrection::platform_only(InputLatency::already_corrected()),
@@ -354,7 +371,7 @@ mod tests {
         );
 
         // Once the clock catches up, the parked marks become usable.
-        log.retry_pending(&synced_clock(now));
+        log.retry_pending(&reference(synced_clock(now)));
         assert_eq!(log.pending_count(), 0);
         assert_eq!(log.observations().len(), 2);
     }
@@ -362,12 +379,12 @@ mod tests {
     #[test]
     fn retried_marks_come_back_in_sample_order() {
         let (bridge, now_stream, now) = rig();
-        let unsynced = ClockModel::new(now).snapshot();
+        let unsynced = reference(ClockModel::new(now).snapshot());
         let mut log = DriftLog::new(
             bridge,
             LatencyCorrection::platform_only(InputLatency::already_corrected()),
         );
-        let clock = synced_clock(now);
+        let clock = reference(synced_clock(now));
 
         // A resolvable mark first, then two parked ones from earlier in the take.
         log.observe(mark(96_000, now_stream + 2_000_000_000), &clock);
@@ -382,7 +399,7 @@ mod tests {
     #[test]
     fn the_anchor_is_sample_zero_and_nothing_else() {
         let (bridge, now_stream, now) = rig();
-        let clock = synced_clock(now);
+        let clock = reference(synced_clock(now));
         let mut log = DriftLog::new(
             bridge,
             LatencyCorrection::platform_only(InputLatency::already_corrected()),
@@ -400,7 +417,7 @@ mod tests {
     #[test]
     fn latency_pulls_the_timestamp_earlier() {
         let (bridge, now_stream, now) = rig();
-        let clock = synced_clock(now);
+        let clock = reference(synced_clock(now));
 
         let mut plain = DriftLog::new(
             bridge,
@@ -425,7 +442,7 @@ mod tests {
     #[test]
     fn parked_marks_are_capped_rather_than_growing_forever() {
         let (bridge, now_stream, now) = rig();
-        let unsynced = ClockModel::new(now).snapshot();
+        let unsynced = reference(ClockModel::new(now).snapshot());
         let mut log = DriftLog::new(
             bridge,
             LatencyCorrection::platform_only(InputLatency::already_corrected()),
@@ -522,12 +539,13 @@ mod tests {
             device_rate: 48_000,
             channels: 2,
             raw_frames: 2_880_000,
-            ntp_server: "time.apple.com".into(),
+            clock_source: "time.apple.com".into(),
             sync_state: "synced".into(),
-            ntp_dispersion_s: Some(0.004928),
+            clock_dispersion_s: Some(0.004928),
             clock_slope_ppm: Some(-16.28),
-            clock_samples_accepted: 14,
-            clock_samples_rejected: 0,
+            clock_samples_accepted: Some(14),
+            clock_samples_rejected: Some(0),
+            start_timecode: None,
             latency_trim_ms: 0.0,
             overruns: 0,
             marks_abandoned: 0,

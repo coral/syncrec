@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use syncrec::audio::{self, session};
-use syncrec::clock::{ClockModel, SyncState, sntp};
+use syncrec::clock::{ClockModel, NtpReference, SyncState, sntp};
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -77,11 +77,10 @@ fn main() -> Result<()> {
 
     let recording = session::start(
         capture,
-        Arc::clone(&clock),
+        Box::new(NtpReference::new(server.clone(), Arc::clone(&clock))),
         session::SessionConfig {
             paths,
             device_name: choice.name.clone(),
-            ntp_server: server.clone(),
             latency: syncrec::latency::LatencyCorrection::platform_only(
                 syncrec::latency::InputLatency::query(Some(&choice.name)),
             ),
@@ -121,7 +120,7 @@ fn main() -> Result<()> {
         Some(t0) => println!("t0           {}", syncrec::bwf::iso8601_nanos(t0)),
         None => println!("t0           UNRESOLVED (clock never synced)"),
     }
-    if let Some(d) = s.ntp_dispersion_s {
+    if let Some(d) = s.clock_dispersion_s {
         println!("dispersion   {:.3} ms", d * 1e3);
     }
 
@@ -176,7 +175,6 @@ fn main() -> Result<()> {
     // Finalise exactly as the app does: fit the drift, run the safety gate, and
     // only resample and delete the scratch capture if the gate is satisfied.
     println!("\n--- finalize ---");
-    let snapshot = clock.lock().unwrap().snapshot();
     let provenance = syncrec::bwf::Provenance {
         t0_unix_nanos: s.t0_unix_nanos.unwrap_or(0),
         sample_rate: audio::TARGET_RATE,
@@ -187,17 +185,18 @@ fn main() -> Result<()> {
         measured_rate: None,
         drift_ratio: None,
         resampled: false,
-        ntp_server: s.ntp_server.clone(),
-        ntp_dispersion_s: s.ntp_dispersion_s,
+        clock_source: s.clock_source.clone(),
+        clock_dispersion_s: s.clock_dispersion_s,
         sync_state: s.sync_state.clone(),
         slope_ppm: s.clock_slope_ppm,
         latency_offset_ms: 0.0,
+        timecode: None,
     };
     let outcome = syncrec::finalize::finalize(
         &take.paths.raw,
         &take.paths.final_wav,
         &s.observations,
-        &snapshot,
+        &take.status,
         &provenance,
     )?;
 

@@ -40,11 +40,16 @@ use rubato::{
 use crate::audio::TARGET_RATE;
 use crate::audio::writer::DriftObservation;
 use crate::bwf::{self, Provenance};
-use crate::clock::{ClockSnapshot, SyncState};
+use crate::clock::RefStatus;
 
 /// Accepted SNTP exchanges the clock must have behind it. Mirrors
 /// [`crate::clock::SYNCED_THRESHOLD`]; checked separately so that loosening the
 /// clock's own definition of "synced" cannot quietly loosen this.
+///
+/// Only applies to a reference that counts exchanges at all. An ethersync leader
+/// is the reference and has nobody to exchange with, so the criterion is skipped
+/// there rather than being satisfied with a made-up number — see
+/// [`RefStatus::samples`].
 pub const MIN_CLOCK_SAMPLES: u64 = 3;
 
 /// Drift observations required before the fit is believed.
@@ -249,8 +254,8 @@ pub fn fit_drift(observations: &[DriftObservation]) -> Option<DriftFit> {
 /// network, and "fit too noisy" means the NTP path is unusable from here.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GateFailure {
-    /// The clock model never reached [`SyncState::Synced`].
-    ClockNotSynced { state: &'static str },
+    /// The time reference never reached a state its timestamps could be trusted in.
+    ClockNotSynced { state: String },
     /// Synced, but on fewer exchanges than we insist on.
     TooFewClockSamples { accepted: u64, required: u64 },
     /// Not enough `(sample, utc)` pairs to fit anything trustworthy.
@@ -399,21 +404,23 @@ impl GateReport {
 /// [`GateFailure::OutputNotVerified`] afterwards if the write did not survive a
 /// read-back.
 pub fn evaluate_gate(
-    clock: &ClockSnapshot,
+    clock: &RefStatus,
     observations: &[DriftObservation],
     fit: Option<&DriftFit>,
     nominal_rate: u32,
 ) -> GateReport {
     let mut report = GateReport::default();
 
-    if clock.state != SyncState::Synced {
+    if !clock.synced {
         report.push(GateFailure::ClockNotSynced {
-            state: clock.state.label(),
+            state: clock.label.clone(),
         });
     }
-    if clock.accepted < MIN_CLOCK_SAMPLES {
+    if let Some(accepted) = clock.samples
+        && accepted < MIN_CLOCK_SAMPLES
+    {
         report.push(GateFailure::TooFewClockSamples {
-            accepted: clock.accepted,
+            accepted,
             required: MIN_CLOCK_SAMPLES,
         });
     }
@@ -740,7 +747,7 @@ pub fn finalize(
     raw: &Path,
     out: &Path,
     observations: &[DriftObservation],
-    clock: &ClockSnapshot,
+    clock: &RefStatus,
     provenance: &Provenance,
 ) -> Result<Outcome> {
     let take = read_raw(raw)?;
@@ -884,8 +891,8 @@ mod tests {
             .collect()
     }
 
-    /// A clock snapshot with `accepted` good exchanges behind it.
-    fn clock_with(accepted: usize) -> ClockSnapshot {
+    /// An NTP reference with `accepted` good exchanges behind it.
+    fn clock_with(accepted: usize) -> RefStatus {
         let base = Instant::now();
         let mut model = ClockModel::new(base);
         for k in 0..accepted {
@@ -897,11 +904,26 @@ mod tests {
                 0.0,
             );
         }
-        model.snapshot()
+        crate::clock::NtpReference::status_of("time.apple.com", &model.snapshot())
     }
 
-    fn synced_clock() -> ClockSnapshot {
+    fn synced_clock() -> RefStatus {
         clock_with(8)
+    }
+
+    /// A reference that does not count exchanges, the way an ethersync leader
+    /// does not: it is the clock, so there is nobody to exchange with.
+    fn uncounted_clock(synced: bool) -> RefStatus {
+        RefStatus {
+            kind: "ethersync",
+            source: "ethersync leader".into(),
+            synced,
+            label: if synced { "rolling" } else { "idle" }.into(),
+            samples: None,
+            discarded: None,
+            dispersion_s: None,
+            slope_ppm: None,
+        }
     }
 
     fn provenance(channels: u16, device_rate: u32) -> Provenance {
@@ -915,11 +937,12 @@ mod tests {
             measured_rate: None,
             drift_ratio: None,
             resampled: false,
-            ntp_server: "time.apple.com".into(),
-            ntp_dispersion_s: Some(0.004),
+            clock_source: "time.apple.com".into(),
+            clock_dispersion_s: Some(0.004),
             sync_state: "synced".into(),
             slope_ppm: Some(-12.0),
             latency_offset_ms: 0.0,
+            timecode: None,
         }
     }
 
@@ -1199,6 +1222,41 @@ mod tests {
         let fit = fit_drift(&obs);
         let report = evaluate_gate(&clock_with(3), &obs, fit.as_ref(), 48_000);
         assert!(report.passed(), "{:?}", report.failures());
+    }
+
+    #[test]
+    fn a_reference_that_counts_nothing_is_not_held_back_by_the_exchange_count() {
+        // An ethersync leader generates the timeline it is being judged against.
+        // There is no exchange to accumulate, so demanding three of them would
+        // mean a leader could never correct a take at all.
+        let obs = observations(120, 47_999.4);
+        let fit = fit_drift(&obs);
+        let report = evaluate_gate(&uncounted_clock(true), &obs, fit.as_ref(), 48_000);
+        assert!(report.passed(), "{:?}", report.failures());
+    }
+
+    #[test]
+    fn a_reference_that_counts_nothing_is_still_held_to_being_synced() {
+        // Skipping the exchange count must not become a way past the gate. A
+        // follower that never locked is exactly as untrustworthy as an unsynced
+        // NTP clock, and has to be reported as such.
+        let obs = observations(120, 47_999.4);
+        let fit = fit_drift(&obs);
+        let report = evaluate_gate(&uncounted_clock(false), &obs, fit.as_ref(), 48_000);
+        assert!(!report.passed());
+        assert!(
+            report
+                .failures()
+                .iter()
+                .any(|f| matches!(f, GateFailure::ClockNotSynced { .. }))
+        );
+        assert!(
+            !report
+                .failures()
+                .iter()
+                .any(|f| matches!(f, GateFailure::TooFewClockSamples { .. })),
+            "there is no exchange count to complain about"
+        );
     }
 
     #[test]

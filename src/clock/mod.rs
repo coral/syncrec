@@ -7,7 +7,10 @@
 //! an answer that does not jump when the system clock does.
 
 pub mod bridge;
+pub mod reference;
 pub mod sntp;
+
+pub use reference::{NtpReference, RefStatus, Reference, TimecodeFormat};
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
