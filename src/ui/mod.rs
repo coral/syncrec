@@ -943,10 +943,25 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn view(&self) -> Element<'_, Message> {
-        match self.screen {
+        let content = match self.screen {
             Screen::Record => self.record_view(),
             Screen::Settings => self.settings_view(),
-        }
+        };
+        let follower_recording = self.slaved() && matches!(self.stage, Stage::Recording { .. });
+
+        // Keep the follower's recording indicator visible on both screens.
+        container(content)
+            .width(Fill)
+            .height(Fill)
+            .style(move |_theme| container::Style {
+                border: Border {
+                    color: ERROR,
+                    width: if follower_recording { 3.0 } else { 0.0 },
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            })
+            .into()
     }
 
     fn record_view(&self) -> Element<'_, Message> {
@@ -1052,10 +1067,11 @@ impl App {
             .clone()
             .unwrap_or_else(|| "--:--:--:--".into());
 
-        let detail = match self.status.dispersion_s {
-            Some(d) => format!("{} · ±{:.2} ms", self.status.source, d * 1e3),
-            None => self.status.source.clone(),
-        };
+        let dispersion = self
+            .status
+            .dispersion_s
+            .map(|d| format!("±{:.2} ms", d * 1e3))
+            .unwrap_or_default();
 
         column![
             roles,
@@ -1066,7 +1082,21 @@ impl App {
             ]
             .spacing(6)
             .align_y(Alignment::Center),
-            text(detail).size(11).color(DIM),
+            row![
+                text(self.status.source.as_str()).size(11).color(DIM),
+                text(if self.status.dispersion_s.is_some() { "·" } else { "" })
+                    .size(11)
+                    .color(DIM),
+                // Reserve space even when the value gains a digit or is unavailable.
+                text(dispersion)
+                    .size(11)
+                    .font(iced::Font::MONOSPACE)
+                    .color(DIM)
+                    .width(90)
+                    .align_x(Alignment::End),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
         ]
         .align_x(Alignment::End)
         .spacing(3)
@@ -1215,7 +1245,7 @@ impl App {
 
         let record = button(text(label).size(15))
             .padding([11, 26])
-            .style(record_style(ready || recording, enabled))
+            .style(record_style(ready || recording, enabled, recording))
             .on_press_maybe(enabled.then_some(Message::ToggleRecord));
 
         // One short line, and it lives on its own row. Sharing a row with the
@@ -1236,7 +1266,7 @@ impl App {
             status,
             row![
                 Space::new().width(Fill),
-                text(elapsed).size(30),
+                text(elapsed).size(30).font(iced::Font::MONOSPACE),
                 Space::new().width(Length::Fixed(16.0)),
                 record,
             ]
@@ -1575,7 +1605,11 @@ const ERROR: Color = Color::from_rgb(0.93, 0.44, 0.40);
 /// Hardcoded rather than taken from the theme palette: a record button has to read
 /// as *red* in any theme, and the operator needs to tell "armed" from "not yet"
 /// across the room without reading the label.
-fn record_style(ready: bool, enabled: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+fn record_style(
+    ready: bool,
+    enabled: bool,
+    recording: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_theme, status| {
         let base = if !enabled {
             Color::from_rgb(0.28, 0.28, 0.30)
@@ -1598,7 +1632,9 @@ fn record_style(ready: bool, enabled: bool) -> impl Fn(&Theme, button::Status) -
             },
             border: Border {
                 radius: 6.0.into(),
-                ..Border::default()
+                // A follower's disabled control still shows that a take is rolling.
+                width: if recording { 2.0 } else { 0.0 },
+                color: ERROR,
             },
             ..button::Style::default()
         }
