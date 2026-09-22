@@ -1165,6 +1165,7 @@ dependencies = [
 [[package]]
 name = "ethersync-protocol"
 version = "0.1.0"
+source = "git+https://github.com/coral/ethersync.git#80bd6d1ea2e2daccfadf842c60c077f258063823"
 dependencies = [
  "prost",
  "prost-build",
@@ -2176,6 +2177,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libethersync"
 version = "0.1.0"
+source = "git+https://github.com/coral/ethersync.git#80bd6d1ea2e2daccfadf842c60c077f258063823"
 dependencies = [
  "bytes",
  "ethersync-protocol",

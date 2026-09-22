@@ -17,7 +17,7 @@ rfd = "0.17"
 rsntp = { version = "4.1", default-features = false }
 iced = { version = "0.14", features = ["canvas", "smol"] }
 # Path dependency until ethersync is published; swap for a version then.
-libethersync = { path = "../ethersync/native" }
+libethersync = { git = "https://github.com/coral/ethersync.git" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
