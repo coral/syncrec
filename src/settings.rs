@@ -17,9 +17,9 @@ use crate::ethersync::{Fps, Role};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TimeSource {
     /// Our own SNTP client, fitted against the monotonic clock.
-    #[default]
     Ntp,
     /// A timecode timeline shared with the rest of the rig over the LAN.
+    #[default]
     Ethersync,
 }
 
@@ -77,10 +77,10 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            source: TimeSource::Ntp,
+            source: TimeSource::Ethersync,
             ntp_server: "pool.ntp.org".into(),
             trim_ms: 0.0,
-            role: Role::Leader,
+            role: Role::Follower,
             fps: Fps::default(),
             drop_frame: false,
             leader_name: "syncrec".into(),
@@ -153,9 +153,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_record_against_ntp_as_before() {
+    fn defaults_follow_an_ethersync_leader() {
         let s = Settings::default();
-        assert_eq!(s.source, TimeSource::Ntp);
+        assert_eq!(s.source, TimeSource::Ethersync);
+        assert_eq!(s.role, Role::Follower);
         assert_eq!(s.ntp_server, "pool.ntp.org");
         assert_eq!(s.trim_ms, 0.0);
     }
@@ -163,8 +164,8 @@ mod tests {
     #[test]
     fn settings_round_trip_through_json() {
         let s = Settings {
-            source: TimeSource::Ethersync,
-            role: Role::Follower,
+            source: TimeSource::Ntp,
+            role: Role::Leader,
             fps: Fps::F29_97,
             drop_frame: true,
             leader_port: 5000,

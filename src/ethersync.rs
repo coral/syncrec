@@ -38,9 +38,9 @@ const DAY_NS: i128 = 86_400_000_000_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Role {
     /// This recorder drives the timecode and the record state for everyone else.
-    #[default]
     Leader,
     /// This recorder takes both from the leader.
+    #[default]
     Follower,
 }
 
