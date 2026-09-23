@@ -22,12 +22,12 @@ use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
-use libethersync::{
+use tidkod::{
     ConnectionState, Discovery, DiscoveryConfig, DiscoveredLeader, Engine, Event, FollowerConfig,
     FrameFormat, Leader, LeaderConfig, MonotonicClock, Position, Rate, Reading, TimecodeReader,
     TimecodeSnapshot, Trust,
 };
-use libethersync::SyncState as LinkSync;
+use tidkod::SyncState as LinkSync;
 
 use crate::clock::{RefStatus, Reference, TimecodeFormat, unix_nanos};
 
@@ -420,7 +420,7 @@ fn status_of(role: Role, source: &str, reading: Option<&Reading>) -> RefStatus {
 enum Kind {
     Leader(Leader),
     Follower {
-        follower: Box<libethersync::Follower>,
+        follower: Box<tidkod::Follower>,
         address: SocketAddr,
     },
     /// A follower with nobody to follow yet, browsing for one.

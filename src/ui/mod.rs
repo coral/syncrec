@@ -31,7 +31,7 @@ use iced::widget::{
     text_input,
 };
 use iced::{Alignment, Border, Color, Element, Fill, Length, Subscription, Task, Theme};
-use libethersync::DiscoveredLeader;
+use tidkod::DiscoveredLeader;
 
 use crate::audio::capture::Capture;
 use crate::audio::meters::Meters;

@@ -1163,17 +1163,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ethersync-protocol"
-version = "0.1.0"
-source = "git+https://github.com/coral/ethersync.git#80bd6d1ea2e2daccfadf842c60c077f258063823"
-dependencies = [
- "prost",
- "prost-build",
- "protox",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "euclid"
 version = "0.22.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2145,8 +2134,9 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "kio"
-version = "0.5.9"
-source = "git+https://github.com/moq-dev/moq?rev=5d0991b9991305be907e6c0682a4e276722eeed0#5d0991b9991305be907e6c0682a4e276722eeed0"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b68395633c21277ff4030327ec49f4e528660cd747dd4146229b72012312ce85"
 dependencies = [
  "loom",
  "smallvec",
@@ -2173,33 +2163,6 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
-
-[[package]]
-name = "libethersync"
-version = "0.1.0"
-source = "git+https://github.com/coral/ethersync.git#80bd6d1ea2e2daccfadf842c60c077f258063823"
-dependencies = [
- "bytes",
- "ethersync-protocol",
- "http",
- "if-addrs",
- "mdns-sd",
- "mio",
- "moq-net",
- "quinn-proto",
- "quinn-udp",
- "rcgen",
- "rustls",
- "sha2",
- "thiserror 2.0.20",
- "time",
- "tracing",
- "triple_buffer",
- "url",
- "uuid 1.26.1",
- "web-transport-proto",
- "web-transport-trait",
-]
 
 [[package]]
 name = "libloading"
@@ -2547,8 +2510,9 @@ dependencies = [
 
 [[package]]
 name = "moq-net"
-version = "0.2.22"
-source = "git+https://github.com/moq-dev/moq?rev=5d0991b9991305be907e6c0682a4e276722eeed0#5d0991b9991305be907e6c0682a4e276722eeed0"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e41050ba3c0a34cdbbb4e9a6ac39d3fec9f90f996d58e8a9068b82d342fdfc3f"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -2568,7 +2532,8 @@ dependencies = [
 [[package]]
 name = "moq-pattern"
 version = "0.1.0"
-source = "git+https://github.com/moq-dev/moq?rev=5d0991b9991305be907e6c0682a4e276722eeed0#5d0991b9991305be907e6c0682a4e276722eeed0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13afcbdcd32b4b7ee0d5220d64a05b139e88ee596c9f27a3cad28b6a201dcd0d"
 dependencies = [
  "serde",
 ]
@@ -4445,7 +4410,6 @@ dependencies = [
  "chrono",
  "cpal",
  "iced",
- "libethersync",
  "objc2 0.6.4",
  "objc2-av-foundation",
  "objc2-foundation 0.3.2",
@@ -4455,6 +4419,7 @@ dependencies = [
  "rubato",
  "serde",
  "serde_json",
+ "tidkod",
  "windows 0.62.2",
 ]
 
@@ -4567,6 +4532,46 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tidkod"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4010faa059c1a16f5a9920af9221740b7d78504bd6d887f851bcf3d6be3640a3"
+dependencies = [
+ "bytes",
+ "http",
+ "if-addrs",
+ "mdns-sd",
+ "mio",
+ "moq-net",
+ "quinn-proto",
+ "quinn-udp",
+ "rcgen",
+ "rustls",
+ "sha2",
+ "thiserror 2.0.20",
+ "tidkod-protocol",
+ "time",
+ "tracing",
+ "triple_buffer",
+ "url",
+ "uuid 1.26.1",
+ "web-transport-proto",
+ "web-transport-trait",
+]
+
+[[package]]
+name = "tidkod-protocol"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7b4ee54cd895d6521e0ac40c55e35907e8bf8b63ecb0364f99cbfe3cfa68bd3"
+dependencies = [
+ "prost",
+ "prost-build",
+ "protox",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
