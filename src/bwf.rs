@@ -136,7 +136,7 @@ pub struct Provenance {
     pub drift_ratio: Option<f64>,
     /// Whether the audio was actually resampled by that ratio.
     pub resampled: bool,
-    /// What the timestamps were measured against: an NTP server, or the ethersync
+    /// What the timestamps were measured against: an NTP server, or the tidkod
     /// leader this machine was locked to.
     pub clock_source: String,
     /// Best estimate of our timestamp error, in seconds.
@@ -148,6 +148,9 @@ pub struct Provenance {
     pub latency_offset_ms: f64,
     /// The timecode at `t0`, when the clock was a timecode source.
     pub timecode: Option<TimecodeStamp>,
+    /// The tidkod recording session, shared by every take of the same roll.
+    /// Written once, in iXML.
+    pub session_id: Option<String>,
 }
 
 /// Samples since local midnight at `t0` — the value `bext.TimeReference` wants.
@@ -277,13 +280,14 @@ pub fn ixml(p: &Provenance) -> String {
     <CLOCK_DISPERSION_MS>{disp}</CLOCK_DISPERSION_MS>
     <CLOCK_SLOPE_PPM>{ppm}</CLOCK_SLOPE_PPM>
     <START_TIMECODE>{start_tc}</START_TIMECODE>
+    <SESSION_ID>{session}</SESSION_ID>
     <LATENCY_TRIM_MS>{trim:.3}</LATENCY_TRIM_MS>
   </SYNCREC>
 </BWFXML>
 "#,
         rate = p.sample_rate,
         note = match &p.timecode {
-            Some(_) => "Timestamps derived from LAN timecode (ethersync), not the OS wall clock.",
+            Some(_) => "Timestamps derived from LAN timecode (tidkod), not the OS wall clock.",
             None => "Timestamps derived from in-process SNTP against a monotonic clock, not the OS wall clock.",
         },
         // iXML wants the *timecode* rate here. Without a timecode source there is
@@ -298,6 +302,7 @@ pub fn ixml(p: &Provenance) -> String {
             _ => "NDF",
         },
         start_tc = p.timecode.as_ref().map(|tc| tc.start.as_str()).unwrap_or_default(),
+        session = xml_escape(p.session_id.as_deref().unwrap_or_default()),
         t0 = iso8601_nanos(p.t0_unix_nanos),
         date = date,
         time = time,
@@ -388,6 +393,7 @@ mod tests {
             slope_ppm: Some(-16.28),
             latency_offset_ms: 0.0,
             timecode: None,
+            session_id: None,
         }
     }
 
@@ -486,7 +492,7 @@ mod tests {
     #[test]
     fn a_timecode_take_carries_its_frame_rate_and_start() {
         let p = Provenance {
-            clock_source: "ethersync follower of 10.0.0.4:4443".into(),
+            clock_source: "tidkod follower of 10.0.0.4:4443".into(),
             timecode: Some(TimecodeStamp {
                 format: TimecodeFormat {
                     numerator: 30000,
@@ -500,7 +506,7 @@ mod tests {
         let h = coding_history(&p);
         assert!(h.contains("T=start_timecode:10:31:07;12"), "{h}");
         assert!(h.contains("T=timecode_rate:29.970 DF"), "{h}");
-        assert!(h.contains("T=clock_source:ethersync follower of"), "{h}");
+        assert!(h.contains("T=clock_source:tidkod follower of"), "{h}");
 
         let x = ixml(&p);
         // Sample rate is not a frame rate. A conform that reads 48000/1 here puts
@@ -515,6 +521,21 @@ mod tests {
         let x = ixml(&provenance());
         assert!(x.contains("<TIMECODE_FLAG>NDF</TIMECODE_FLAG>"), "{x}");
         assert!(x.contains("<START_TIMECODE></START_TIMECODE>"), "{x}");
+        assert!(x.contains("<SESSION_ID></SESSION_ID>"), "{x}");
+    }
+
+    #[test]
+    fn the_session_id_is_written_once_in_ixml() {
+        let id = "12345678-9abc-def0-0123-456789abcdef";
+        let p = Provenance {
+            session_id: Some(id.into()),
+            ..provenance()
+        };
+        let x = ixml(&p);
+        assert!(x.contains(&format!("<SESSION_ID>{id}</SESSION_ID>")), "{x}");
+        assert_eq!(x.matches(id).count(), 1, "{x}");
+        assert!(!coding_history(&p).contains(id));
+        assert!(!bext(&p).description.contains(id));
     }
 
     #[test]

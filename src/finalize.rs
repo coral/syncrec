@@ -46,7 +46,7 @@ use crate::clock::RefStatus;
 /// [`crate::clock::SYNCED_THRESHOLD`]; checked separately so that loosening the
 /// clock's own definition of "synced" cannot quietly loosen this.
 ///
-/// Only applies to a reference that counts exchanges at all. An ethersync leader
+/// Only applies to a reference that counts exchanges at all. An tidkod leader
 /// is the reference and has nobody to exchange with, so the criterion is skipped
 /// there rather than being satisfied with a made-up number — see
 /// [`RefStatus::samples`].
@@ -911,12 +911,12 @@ mod tests {
         clock_with(8)
     }
 
-    /// A reference that does not count exchanges, the way an ethersync leader
+    /// A reference that does not count exchanges, the way an tidkod leader
     /// does not: it is the clock, so there is nobody to exchange with.
     fn uncounted_clock(synced: bool) -> RefStatus {
         RefStatus {
-            kind: "ethersync",
-            source: "ethersync leader".into(),
+            kind: "tidkod",
+            source: "tidkod leader".into(),
             synced,
             label: if synced { "rolling" } else { "idle" }.into(),
             samples: None,
@@ -943,6 +943,7 @@ mod tests {
             slope_ppm: Some(-12.0),
             latency_offset_ms: 0.0,
             timecode: None,
+            session_id: None,
         }
     }
 
@@ -1226,7 +1227,7 @@ mod tests {
 
     #[test]
     fn a_reference_that_counts_nothing_is_not_held_back_by_the_exchange_count() {
-        // An ethersync leader generates the timeline it is being judged against.
+        // An tidkod leader generates the timeline it is being judged against.
         // There is no exchange to accumulate, so demanding three of them would
         // mean a leader could never correct a take at all.
         let obs = observations(120, 47_999.4);

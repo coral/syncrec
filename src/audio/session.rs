@@ -110,8 +110,8 @@ impl Drop for Recording {
 /// Start capturing. The returned handle owns the stream until it is stopped.
 ///
 /// `reference` is whatever this take is being timestamped against — the SNTP model
-/// or an ethersync timeline — and the writer thread owns it outright for the life
-/// of the take, because resolving a mark from an ethersync reader mutates it.
+/// or an tidkod timeline — and the writer thread owns it outright for the life
+/// of the take, because resolving a mark from an tidkod reader mutates it.
 pub fn start(
     capture: Capture,
     reference: Box<dyn Reference>,
@@ -296,7 +296,8 @@ fn build_sidecar(
         clock_samples_rejected: status.discarded,
         start_timecode: t0
             .zip(reference.timecode_format())
-            .and_then(|(t0, tc)| crate::ethersync::label_at(t0, tc)),
+            .and_then(|(t0, tc)| crate::tidkod::label_at(t0, tc)),
+        session_id: reference.session_id(),
         latency_trim_ms: config.latency.trim_ms(),
         overruns,
         marks_abandoned: drift.abandoned_count(),

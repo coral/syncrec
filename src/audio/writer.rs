@@ -17,7 +17,7 @@
 //! parked and retried. That matters most for the very first mark, which is the
 //! recording's anchor.
 //!
-//! Nothing here knows or cares whether the UTC came from NTP or from an ethersync
+//! Nothing here knows or cares whether the UTC came from NTP or from an tidkod
 //! timecode leader. Both answer the same one question — what UTC was this
 //! `Instant`? — which is the entire reason a second time source could be added
 //! without touching the drift fit, the safety gate or the file writer.
@@ -232,7 +232,7 @@ pub struct Sidecar {
     pub device_rate: u32,
     pub channels: u16,
     pub raw_frames: u64,
-    /// What the timestamps were measured against: an NTP server, or the ethersync
+    /// What the timestamps were measured against: an NTP server, or the tidkod
     /// leader this machine was locked to.
     pub clock_source: String,
     pub sync_state: String,
@@ -244,6 +244,9 @@ pub struct Sidecar {
     /// The timecode this take started at, when it came from a timecode source.
     #[serde(default)]
     pub start_timecode: Option<String>,
+    /// The tidkod recording session this take was part of.
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub latency_trim_ms: f64,
     pub overruns: u64,
     pub marks_abandoned: u64,
@@ -546,6 +549,7 @@ mod tests {
             clock_samples_accepted: Some(14),
             clock_samples_rejected: Some(0),
             start_timecode: None,
+            session_id: None,
             latency_trim_ms: 0.0,
             overruns: 0,
             marks_abandoned: 0,

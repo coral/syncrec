@@ -13,7 +13,7 @@
 //! the frame rate, which machine leads — lives on the settings screen, where an
 //! operator watching a meter cannot reach it by accident.
 //!
-//! In ethersync follower mode the record button is not a button. The leader's
+//! In tidkod follower mode the record button is not a button. The leader's
 //! transport is the record state for the whole rig, so this machine watches it and
 //! rolls when it rolls; offering a local override would only ever produce a take
 //! that does not line up with the others.
@@ -40,7 +40,7 @@ use crate::audio::writer::{Sidecar, TakePaths};
 use crate::audio::{self, DeviceChoice, Negotiated};
 use crate::bwf::{Provenance, TimecodeStamp};
 use crate::clock::{ClockModel, ClockSnapshot, NtpReference, RefStatus, Reference, sntp};
-use crate::ethersync::{Fps, Link, Role};
+use crate::tidkod::{Fps, Link, Role};
 use crate::finalize::{self, Outcome};
 use crate::latency::{InputLatency, LatencyCorrection};
 use crate::permission::{self, PermissionStatus};
@@ -251,14 +251,14 @@ impl App {
 
     /// Whether this machine is driving the rig's transport.
     fn leading(&self) -> bool {
-        self.settings.source == TimeSource::Ethersync
+        self.settings.source == TimeSource::Tidkod
             && self.settings.role == Role::Leader
             && self.link.is_some()
     }
 
     /// Whether this machine's record button belongs to somebody else.
     fn slaved(&self) -> bool {
-        self.settings.source == TimeSource::Ethersync && self.settings.role == Role::Follower
+        self.settings.source == TimeSource::Tidkod && self.settings.role == Role::Follower
     }
 
     /// Build the reference this take will be measured against.
@@ -268,11 +268,11 @@ impl App {
                 self.settings.ntp_server.clone(),
                 Arc::clone(&self.clock),
             ))),
-            TimeSource::Ethersync => {
+            TimeSource::Tidkod => {
                 let link = self
                     .link
                     .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("no ethersync link"))?;
+                    .ok_or_else(|| anyhow::anyhow!("no tidkod link"))?;
                 Ok(Box::new(link.reference()?))
             }
         }
@@ -289,7 +289,7 @@ impl App {
         self.pending_roll = false;
         match self.settings.source {
             TimeSource::Ntp => self.restart_clock(),
-            TimeSource::Ethersync => self.relink(),
+            TimeSource::Tidkod => self.relink(),
         }
         self.refresh_status();
     }
@@ -304,7 +304,7 @@ impl App {
         }
     }
 
-    /// Stand up the ethersync engine for the configured role.
+    /// Stand up the tidkod engine for the configured role.
     fn relink(&mut self) {
         // The old engine owns a worker thread, a UDP socket and possibly an mDNS
         // registration. Drop it before binding anything again.
@@ -375,7 +375,7 @@ impl App {
                 };
                 self.timecode = None;
             }
-            TimeSource::Ethersync => match &mut self.link {
+            TimeSource::Tidkod => match &mut self.link {
                 Some(link) => {
                     self.status = link.status();
                     self.timecode = link.label();
@@ -697,7 +697,7 @@ impl App {
             }
         }
 
-        if self.settings.source == TimeSource::Ethersync {
+        if self.settings.source == TimeSource::Tidkod {
             self.tick_link();
             self.refresh_endpoints();
         }
@@ -990,7 +990,7 @@ impl App {
     fn header(&self) -> Element<'_, Message> {
         let right: Element<'_, Message> = match self.settings.source {
             TimeSource::Ntp => self.ntp_indicator(),
-            TimeSource::Ethersync => self.link_indicator(),
+            TimeSource::Tidkod => self.link_indicator(),
         };
 
         row![
@@ -1039,7 +1039,7 @@ impl App {
         .into()
     }
 
-    /// The ethersync corner: which end of the rig this is, and what it can see.
+    /// The tidkod corner: which end of the rig this is, and what it can see.
     ///
     /// The role lives here rather than in settings because it is the one link
     /// setting that changes on the day — a machine is promoted to leader because
@@ -1293,7 +1293,7 @@ impl App {
             rule::horizontal(1),
             self.ntp_section(),
             rule::horizontal(1),
-            self.ethersync_section(),
+            self.tidkod_section(),
             rule::horizontal(1),
             self.input_section(),
         ]
@@ -1360,7 +1360,7 @@ impl App {
         )
     }
 
-    fn ethersync_section(&self) -> Element<'_, Message> {
+    fn tidkod_section(&self) -> Element<'_, Message> {
         let roles = row![
             radio("Leader", Role::Leader, Some(self.settings.role), Message::RoleSelected)
                 .size(15)
@@ -1401,7 +1401,7 @@ impl App {
         };
 
         section(
-            "Ethersync",
+            "Tidkod",
             column![
                 roles,
                 rate,
@@ -1739,6 +1739,7 @@ fn finalize_take(take: &session::TakeResult, trim_ms: f64) -> anyhow::Result<Out
         slope_ppm: sidecar.clock_slope_ppm,
         latency_offset_ms: trim_ms,
         timecode,
+        session_id: sidecar.session_id.clone(),
     };
 
     // Correction is not optional. Whether it is actually applied is the safety

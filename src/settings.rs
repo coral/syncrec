@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ethersync::{Fps, Role};
+use crate::tidkod::{Fps, Role};
 
 /// Where a take's timestamps come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -19,17 +19,19 @@ pub enum TimeSource {
     /// Our own SNTP client, fitted against the monotonic clock.
     Ntp,
     /// A timecode timeline shared with the rest of the rig over the LAN.
+    /// Settings files written before the rename still say `Ethersync`.
     #[default]
-    Ethersync,
+    #[serde(alias = "Ethersync")]
+    Tidkod,
 }
 
 impl TimeSource {
-    pub const ALL: [TimeSource; 2] = [TimeSource::Ntp, TimeSource::Ethersync];
+    pub const ALL: [TimeSource; 2] = [TimeSource::Ntp, TimeSource::Tidkod];
 
     pub fn label(self) -> &'static str {
         match self {
             TimeSource::Ntp => "NTP",
-            TimeSource::Ethersync => "Ethersync",
+            TimeSource::Tidkod => "Tidkod",
         }
     }
 
@@ -40,7 +42,7 @@ impl TimeSource {
                 "Absolute UTC from a time server. Each recorder is independently \
                  right, to within its own network path."
             }
-            TimeSource::Ethersync => {
+            TimeSource::Tidkod => {
                 "LAN timecode from a leader. Recorders agree with each other \
                  exactly, and the leader's transport drives everyone's record button."
             }
@@ -77,7 +79,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            source: TimeSource::Ethersync,
+            source: TimeSource::Tidkod,
             ntp_server: "pool.ntp.org".into(),
             trim_ms: 0.0,
             role: Role::Follower,
@@ -153,9 +155,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_follow_an_ethersync_leader() {
+    fn defaults_follow_an_tidkod_leader() {
         let s = Settings::default();
-        assert_eq!(s.source, TimeSource::Ethersync);
+        assert_eq!(s.source, TimeSource::Tidkod);
         assert_eq!(s.role, Role::Follower);
         assert_eq!(s.ntp_server, "pool.ntp.org");
         assert_eq!(s.trim_ms, 0.0);
@@ -183,7 +185,7 @@ mod tests {
         // anyone who already has a preferences file.
         let old = r#"{"source":"Ethersync","ntp_server":"time.apple.com"}"#;
         let s: Settings = serde_json::from_str(old).unwrap();
-        assert_eq!(s.source, TimeSource::Ethersync);
+        assert_eq!(s.source, TimeSource::Tidkod);
         assert_eq!(s.ntp_server, "time.apple.com");
         assert_eq!(s.fps, Fps::default(), "an absent setting takes its default");
     }

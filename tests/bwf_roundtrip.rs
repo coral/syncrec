@@ -44,6 +44,7 @@ fn provenance(t0: i128, channels: u16) -> Provenance {
         slope_ppm: Some(-16.28),
         latency_offset_ms: 0.0,
         timecode: None,
+        session_id: None,
     }
 }
 

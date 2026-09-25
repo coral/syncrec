@@ -1,7 +1,7 @@
 //! The time reference a take is measured against, whichever kind it is.
 //!
 //! Until now there was only one: the SNTP-fitted model in this module's parent.
-//! Ethersync adds a second, where UTC comes from a timecode timeline shared over
+//! Tidkod adds a second, where UTC comes from a timecode timeline shared over
 //! the LAN rather than from a public NTP server. Everything downstream of the
 //! capture path — the drift log, the drift fit, the safety gate, `bext` — only ever
 //! needed one thing from the clock, "what UTC was this `Instant`?", so that is the
@@ -14,7 +14,7 @@ use super::{ClockModel, ClockSnapshot, SyncState};
 
 /// The timecode format a reference stamps in, when it stamps timecode at all.
 ///
-/// Kept as plain numbers rather than an ethersync `FrameFormat` so that the file
+/// Kept as plain numbers rather than an tidkod `FrameFormat` so that the file
 /// writer and the session do not have to know a timecode library exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimecodeFormat {
@@ -42,7 +42,7 @@ pub struct RefStatus {
     /// whole of `source`.
     pub kind: &'static str,
     /// Where the timestamps came from, as it should read in the file:
-    /// `pool.ntp.org`, `ethersync leader`, `ethersync follower 10.0.0.4:4443`.
+    /// `pool.ntp.org`, `tidkod leader`, `tidkod follower 10.0.0.4:4443`.
     pub source: String,
     /// Whether the reference is good enough to have timestamped this take.
     pub synced: bool,
@@ -115,6 +115,12 @@ pub trait Reference: Send {
     /// The timecode format this reference stamps in. `None` for a clock that only
     /// knows UTC, which is every NTP reference: there is no frame rate to report.
     fn timecode_format(&self) -> Option<TimecodeFormat> {
+        None
+    }
+
+    /// The recording session this take belongs to, shared by every machine that
+    /// recorded the same roll. `None` for a clock with no notion of a rig.
+    fn session_id(&self) -> Option<String> {
         None
     }
 }
@@ -241,8 +247,8 @@ mod tests {
         // The leader case: nothing to exchange with, so the exchange count must not
         // be able to hold it back.
         let status = RefStatus {
-            kind: "ethersync",
-            source: "ethersync leader".into(),
+            kind: "tidkod",
+            source: "tidkod leader".into(),
             synced: true,
             label: "leader".into(),
             samples: None,

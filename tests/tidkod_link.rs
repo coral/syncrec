@@ -1,6 +1,6 @@
-//! Two ethersync links on loopback, exercised the way a rig uses them.
+//! Two tidkod links on loopback, exercised the way a rig uses them.
 //!
-//! The unit tests in `src/ethersync.rs` check the timecode arithmetic against
+//! The unit tests in `src/tidkod.rs` check the timecode arithmetic against
 //! itself. These check the claim that actually matters: that a follower's idea of
 //! UTC agrees with the leader's, that the leader's transport reaches the follower,
 //! and that both of them hand `session` a reference it can timestamp a take with.
@@ -12,7 +12,7 @@
 use std::time::{Duration, Instant};
 
 use syncrec::clock::Reference;
-use syncrec::ethersync::{Fps, Link};
+use syncrec::tidkod::{Fps, Link};
 
 /// Long enough for a loopback QUIC handshake and a few clock probes, short enough
 /// that a genuinely broken link fails the suite rather than hanging it.
@@ -117,6 +117,36 @@ fn the_leaders_transport_is_the_followers_record_button() {
 }
 
 #[test]
+fn every_roll_is_a_new_session_that_both_ends_stamp() {
+    let (mut leader, mut follower) = rig();
+
+    let session_of_a_roll = |leader: &mut Link, follower: &mut Link| {
+        leader.roll().expect("rolling");
+        // Synced, not just rolling: a follower's take anchors, and so learns its
+        // session, on the first reading it can actually timestamp against.
+        until("the follower to synchronise on the roll", follower, |l| {
+            l.rolling() == Some(true) && l.status().synced
+        });
+        let mut here = leader.reference().expect("leader reference");
+        let mut there = follower.reference().expect("follower reference");
+        here.refresh();
+        there.refresh();
+        let ours = here.session_id().expect("the leader stamps its session");
+        let theirs = there.session_id().expect("the follower stamps the leader's session");
+        assert_eq!(ours, theirs, "both ends of one roll must share a session");
+        leader.halt().expect("halting");
+        until("the follower to see the stop", follower, |l| {
+            l.rolling() == Some(false)
+        });
+        ours
+    };
+
+    let first = session_of_a_roll(&mut leader, &mut follower);
+    let second = session_of_a_roll(&mut leader, &mut follower);
+    assert_ne!(first, second, "each recording must get its own session");
+}
+
+#[test]
 fn a_paused_timeline_stamps_nothing_at_either_end() {
     // The tail-of-take case. A follower notices the leader stop up to one tick
     // late, and its writer thread then drains the ring and resolves whatever marks
@@ -168,7 +198,7 @@ fn a_paused_timeline_stamps_nothing_at_either_end() {
 fn a_follower_reports_the_exchanges_behind_its_lock() {
     // The safety gate will not resample a take destructively until the reference
     // has several independent confirmations behind it — three accepted SNTP
-    // exchanges, for the clock model. Ethersync now reports the same quantity, so
+    // exchanges, for the clock model. Tidkod now reports the same quantity, so
     // both sources are held to one standard instead of a follower getting in on
     // whatever `Synchronized` happens to mean this week.
     let (mut leader, mut follower) = rig();

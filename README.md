@@ -27,19 +27,19 @@ two machines agree only as well as their two independent network paths allow. It
 is the right answer for a lone recorder, and for anything that has to line up with
 the rest of the world rather than with the machine next to it.
 
-**Ethersync** answers *what time does the leader think it is?* — LAN timecode from
-[ethersync](https://github.com/coral/ethersync). That is a worse question to ask of
+**Tidkod** answers *what time does the leader think it is?* — LAN timecode from
+[tidkod](https://crates.io/crates/tidkod). That is a worse question to ask of
 the universe and a much better one to ask of a rig: every follower is wrong by the
 same amount, so the takes line up with each other *exactly*, which is the property
 a multi-recorder shoot actually needs. On loopback the two ends agree to under
-0.15 ms; see `tests/ethersync_link.rs`, which measures it.
+0.15 ms; see `tests/tidkod_link.rs`, which measures it.
 
 Everything downstream of the capture path is indifferent to which one is running.
 Both answer the same single question — *what UTC was this `Instant`?* — so the
 drift log, the drift fit, the safety gate and the file writer never learn that the
 clock changed underneath them.
 
-## Ethersync: leader and follower
+## Tidkod: leader and follower
 
 The role switch lives in the top right of the recording window, not four clicks
 deep in settings, because a machine gets promoted to leader on the day — usually
@@ -74,7 +74,7 @@ not to trust. It is used for one thing only, and to hours of precision: deciding
 which second of which day the rig is anchored to. From that anchor on, every
 follower is locked to the leader's *monotonic* clock, not to anybody's wall clock.
 Absolute accuracy is the leader's OS clock; relative accuracy across the rig is
-ethersync's, which is far better. Pick NTP if it is the first number you care about.
+tidkod's, which is far better. Pick NTP if it is the first number you care about.
 
 ## Build and run
 
@@ -144,8 +144,8 @@ cargo run --example record-probe -- 25 time.apple.com
 ```
 
 Runs SNTP → clock model → device → ring buffer → writer thread → WAV + sidecar and
-reports the device's measured rate. NTP only; the ethersync path is covered by
-`cargo test --test ethersync_link`, which stands a leader and a follower up on
+reports the device's measured rate. NTP only; the tidkod path is covered by
+`cargo test --test tidkod_link`, which stands a leader and a follower up on
 loopback and checks that they agree about UTC and that the transport carries.
 
 ## What a take produces
@@ -181,10 +181,10 @@ The corrected file replaces the original, so the correction has to be trustworth
 before the raw capture is deleted. All of these must hold:
 
 - the time reference reported itself synced — `Synced` for the clock model,
-  `Synchronized` for an ethersync follower
+  `Synchronized` for an tidkod follower
 - at least 3 accepted clock exchanges, *when the reference counts exchanges at
-  all*. An ethersync follower counts its own and is held to exactly the same
-  three, so neither source gets in on a single lucky sample. An ethersync leader
+  all*. An tidkod follower counts its own and is held to exactly the same
+  three, so neither source gets in on a single lucky sample. An tidkod leader
   generates the timeline it is being judged against and has nobody to exchange
   with, so for a leader the criterion is skipped rather than satisfied with a
   made-up number. Being skipped is not a way past the gate: an unsynced reference
@@ -220,7 +220,7 @@ nothing worth correcting and no way to measure it if there were.
 ```
 src/clock/       the clock model: SNTP polling, the 8-sample fit, the audio-clock bridge
 src/clock/reference.rs  the interface both time sources answer to
-src/ethersync.rs LAN timecode: the engine, time-of-day conversion, leader and follower
+src/tidkod.rs LAN timecode: the engine, time-of-day conversion, leader and follower
 src/settings.rs  the settings page's state, and where it lives between launches
 src/audio/       device negotiation, the realtime capture callback, metering, the writer thread
 src/bwf.rs       bext / iXML construction and the TimeReference maths
@@ -230,8 +230,8 @@ src/permission.rs microphone permission
 src/ui/          the iced front end
 ```
 
-Ethersync is a path dependency on a sibling checkout until it is published:
+Tidkod comes from crates.io:
 
 ```toml
-libethersync = { path = "../ethersync/native" }
+tidkod = "0.1.1"
 ```

@@ -191,6 +191,7 @@ fn main() -> Result<()> {
         slope_ppm: s.clock_slope_ppm,
         latency_offset_ms: 0.0,
         timecode: None,
+        session_id: s.session_id.clone(),
     };
     let outcome = syncrec::finalize::finalize(
         &take.paths.raw,

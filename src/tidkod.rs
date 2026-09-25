@@ -1,8 +1,8 @@
-//! Ethersync as a time reference: LAN timecode instead of a public NTP server.
+//! Tidkod as a time reference: LAN timecode instead of a public NTP server.
 //!
 //! The two modes answer different questions. NTP answers "what time is it really?",
 //! and every recorder on the job answers it separately, so two machines agree only
-//! as well as their two independent network paths allow. Ethersync answers "what
+//! as well as their two independent network paths allow. Tidkod answers "what
 //! time does the *leader* think it is?", which is a worse question to ask of the
 //! universe and a much better one to ask of a rig: every follower is wrong by the
 //! same amount, so the takes line up with each other exactly, which is the property
@@ -22,12 +22,12 @@ use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
-use tidkod::{
+use ::tidkod::{
     ConnectionState, Discovery, DiscoveryConfig, DiscoveredLeader, Engine, Event, FollowerConfig,
     FrameFormat, Leader, LeaderConfig, MonotonicClock, Position, Rate, Reading, TimecodeReader,
     TimecodeSnapshot, Trust,
 };
-use tidkod::SyncState as LinkSync;
+use ::tidkod::SyncState as LinkSync;
 
 use crate::clock::{RefStatus, Reference, TimecodeFormat, unix_nanos};
 
@@ -61,7 +61,7 @@ impl std::fmt::Display for Role {
     }
 }
 
-/// The frame rates ethersync accepts, as the operator thinks of them.
+/// The frame rates tidkod accepts, as the operator thinks of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Fps {
     F23_976,
@@ -215,7 +215,7 @@ struct DayAnchor {
     tod: i128,
 }
 
-/// An ethersync timeline behind [`Reference`], so a take cannot tell the difference.
+/// An tidkod timeline behind [`Reference`], so a take cannot tell the difference.
 pub struct TimecodeReference {
     reader: TimecodeReader,
     clock: MonotonicClock,
@@ -229,6 +229,12 @@ pub struct TimecodeReference {
     snapshot: Option<TimecodeSnapshot>,
     latest: Option<Reading>,
     anchor: Option<DayAnchor>,
+    /// The leader's recording session as of the moment the day was anchored.
+    ///
+    /// Captured once, alongside the anchor, rather than read at the end: the
+    /// leader rotates it at the top of every roll, and a follower that finishes
+    /// late must not label its take with the *next* roll's session.
+    session_id: Option<[u8; 16]>,
 }
 
 /// Whether a reading can place a timestamp at all.
@@ -288,6 +294,7 @@ impl Reference for TimecodeReference {
                 utc: unix_nanos_for_tod(tod, unix_nanos(SystemTime::now())),
                 tod,
             });
+            self.session_id = r.session_id;
         }
 
         self.latest = reading;
@@ -330,6 +337,24 @@ impl Reference for TimecodeReference {
             drop_frame: format.drop_frame(),
         })
     }
+
+    fn session_id(&self) -> Option<String> {
+        self.session_id.map(format_session_id)
+    }
+}
+
+/// A session ID in the canonical hyphenated UUID form, which is what anyone
+/// grepping a folder of takes for matching sessions will paste.
+pub fn format_session_id(id: [u8; 16]) -> String {
+    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// The slate label a UTC instant carries in a given timecode format.
@@ -356,7 +381,7 @@ fn signed_nanos(base: Instant, t: Instant) -> i128 {
 fn status_of(role: Role, source: &str, reading: Option<&Reading>) -> RefStatus {
     match role {
         Role::Leader => RefStatus {
-            kind: "ethersync",
+            kind: "tidkod",
             source: source.to_string(),
             // A leader is the reference. There is no exchange to wait for and no
             // offset to converge, so it is ready from the moment it exists; the
@@ -374,7 +399,7 @@ fn status_of(role: Role, source: &str, reading: Option<&Reading>) -> RefStatus {
         Role::Follower => {
             let Some(r) = reading else {
                 return RefStatus {
-                    kind: "ethersync",
+                    kind: "tidkod",
                     source: source.to_string(),
                     synced: false,
                     label: "connecting".into(),
@@ -393,7 +418,7 @@ fn status_of(role: Role, source: &str, reading: Option<&Reading>) -> RefStatus {
                 _ => (false, "disconnected"),
             };
             RefStatus {
-                kind: "ethersync",
+                kind: "tidkod",
                 source: source.to_string(),
                 synced,
                 label: label.into(),
@@ -420,16 +445,16 @@ fn status_of(role: Role, source: &str, reading: Option<&Reading>) -> RefStatus {
 enum Kind {
     Leader(Leader),
     Follower {
-        follower: Box<tidkod::Follower>,
+        follower: Box<::tidkod::Follower>,
         address: SocketAddr,
     },
     /// A follower with nobody to follow yet, browsing for one.
     Browsing(Discovery),
 }
 
-/// One ethersync engine and whatever it is currently doing.
+/// One tidkod engine and whatever it is currently doing.
 ///
-/// Held for as long as the mode is ethersync, not just while recording: followers
+/// Held for as long as the mode is tidkod, not just while recording: followers
 /// have to be watching the leader's transport in order to notice it roll, and a
 /// leader has to be advertising in order to be found before the take starts.
 pub struct Link {
@@ -451,7 +476,7 @@ impl Link {
     /// being told an address. Off is for a network where multicast is unavailable
     /// or unwelcome, and for tests, which should not put a service on the LAN.
     pub fn leader(name: &str, port: u16, format: FrameFormat, advertise: bool) -> Result<Self> {
-        let engine = Engine::new().context("starting the ethersync engine")?;
+        let engine = Engine::new().context("starting the tidkod engine")?;
         let clock = engine.clock();
         let config = LeaderConfig {
             bind: SocketAddr::from(([0, 0, 0, 0], port)),
@@ -464,7 +489,7 @@ impl Link {
             advertise,
             ..Default::default()
         };
-        let leader = engine.leader(config).context("becoming the ethersync leader")?;
+        let leader = engine.leader(config).context("becoming the tidkod leader")?;
         let mut link = Self {
             engine,
             kind: Kind::Leader(leader),
@@ -480,7 +505,7 @@ impl Link {
 
     /// Follow a named leader.
     pub fn follower(address: SocketAddr, fingerprint: Option<&str>, format: FrameFormat) -> Result<Self> {
-        let engine = Engine::new().context("starting the ethersync engine")?;
+        let engine = Engine::new().context("starting the tidkod engine")?;
         let clock = engine.clock();
         let mut config = FollowerConfig::direct(address);
         config.fallback_format = format;
@@ -489,7 +514,7 @@ impl Link {
         }
         let follower = engine
             .follower(config)
-            .with_context(|| format!("following the ethersync leader at {address}"))?;
+            .with_context(|| format!("following the tidkod leader at {address}"))?;
         let mut link = Self {
             engine,
             kind: Kind::Follower {
@@ -508,11 +533,11 @@ impl Link {
 
     /// Browse for leaders without connecting to any of them yet.
     pub fn browsing(format: FrameFormat) -> Result<Self> {
-        let engine = Engine::new().context("starting the ethersync engine")?;
+        let engine = Engine::new().context("starting the tidkod engine")?;
         let clock = engine.clock();
         let discovery = engine
             .discovery(DiscoveryConfig::default())
-            .context("browsing for ethersync leaders")?;
+            .context("browsing for tidkod leaders")?;
         Ok(Self {
             engine,
             kind: Kind::Browsing(discovery),
@@ -535,9 +560,9 @@ impl Link {
     /// Where this link says its timestamps come from, for the file.
     pub fn source(&self) -> String {
         match &self.kind {
-            Kind::Leader(l) => format!("ethersync leader {}", l.info().address),
-            Kind::Follower { address, .. } => format!("ethersync follower of {address}"),
-            Kind::Browsing(_) => "ethersync (no leader)".into(),
+            Kind::Leader(l) => format!("tidkod leader {}", l.info().address),
+            Kind::Follower { address, .. } => format!("tidkod follower of {address}"),
+            Kind::Browsing(_) => "tidkod (no leader)".into(),
         }
     }
 
@@ -595,6 +620,7 @@ impl Link {
             snapshot: None,
             latest: None,
             anchor: None,
+            session_id: None,
         })
     }
 
@@ -616,7 +642,13 @@ impl Link {
         self.reading().map(|r| r.rate != Rate::PAUSED)
     }
 
-    /// Roll: anchor the timeline to the time of day and start it.
+    /// Roll: start a new recording session, anchor the timeline to the time of
+    /// day and start it.
+    ///
+    /// Every roll is its own session, so takes from different machines can be
+    /// matched up afterwards by ID rather than by squinting at start timecodes.
+    /// The ID is published before the transport moves, so no follower can see
+    /// the roll without also having seen the session it belongs to.
     ///
     /// The wall clock is sampled between two engine-clock reads so that the anchor
     /// carries the instant the time was actually taken, rather than the instant the
@@ -626,6 +658,9 @@ impl Link {
         let Kind::Leader(leader) = &self.kind else {
             return Ok(());
         };
+        leader
+            .rotate_session_id()
+            .context("starting a new tidkod recording session")?;
         let before = self.engine.clock().now_ns();
         let wall = unix_nanos(SystemTime::now());
         let after = self.engine.clock().now_ns();
@@ -634,7 +669,7 @@ impl Link {
         let position = position_for_tod(tod_of(wall), self.format);
         leader
             .set_transport(position, Rate::NORMAL, Some(sampled_at))
-            .context("rolling the ethersync transport")?;
+            .context("rolling the tidkod transport")?;
         Ok(())
     }
 
@@ -643,7 +678,7 @@ impl Link {
         let Kind::Leader(leader) = &self.kind else {
             return Ok(());
         };
-        leader.pause().context("pausing the ethersync transport")?;
+        leader.pause().context("pausing the tidkod transport")?;
         Ok(())
     }
 
@@ -713,6 +748,15 @@ mod tests {
 
     fn fmt(n: u32, d: u32, drop: bool) -> FrameFormat {
         FrameFormat::new(n, d, drop).unwrap()
+    }
+
+    #[test]
+    fn session_ids_print_as_uuids() {
+        let id = [
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef,
+        ];
+        assert_eq!(format_session_id(id), "12345678-9abc-def0-0123-456789abcdef");
     }
 
     #[test]
@@ -830,7 +874,7 @@ mod tests {
     #[test]
     fn drop_frame_is_refused_for_rates_that_have_nothing_to_drop() {
         // 25 fps does not drift against the wall clock, so drop-frame numbering is
-        // meaningless there and ethersync rejects it. Asking for it must not fail
+        // meaningless there and tidkod rejects it. Asking for it must not fail
         // the whole configuration.
         assert!(!Fps::F25.supports_drop_frame());
         let f = Fps::F25.format(true).unwrap();
@@ -841,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn every_offered_frame_rate_is_one_ethersync_accepts() {
+    fn every_offered_frame_rate_is_one_tidkod_accepts() {
         for fps in Fps::ALL {
             assert!(fps.format(false).is_ok(), "{fps}");
         }
